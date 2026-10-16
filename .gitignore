@@ -1,0 +1,11 @@
+__pycache__/
+.deps/
+.venv/
+data/
+input/
+apinaptien/
+autocrypto/
+backups/
+tickets.json
+user_languages.json
+config.json
