@@ -92,7 +92,7 @@ DEFAULT_CONFIG = {
     "vcb_bin": "970436",
 
     "vcb_account_number": "YOUR_VCB_ACCOUNT_NUMBER",
-    "vcb_account_name": "LEMON COOKIE",
+    "vcb_account_name": "LEMON SERVICE",
 
     "usd_to_vnd": 25000
 }
@@ -787,7 +787,7 @@ VCB_ACCOUNT_NUMBER = str(
 VCB_ACCOUNT_NAME = str(
     config.get(
         "vcb_account_name",
-        "LEMON COOKIE"
+        "LEMON SERVICE"
     )
 ).strip()
 
@@ -1999,7 +1999,7 @@ def create_payfjord_invoice(
         "api_key": PAYFJORD_API_KEY,
 
         "name": (
-            f"Lemon Cookie - {username}"
+            f"Lemon Service - {username}"
         ),
 
         "amount": str(
@@ -2480,7 +2480,7 @@ UI_BLUE = 0x3498DB
 UI_PURPLE = 0x9B59B6
 UI_DARK = 0x2B2D31
 
-SHOP_FOOTER = "🍋 Lemon Cookie • Secure Auto System"
+SHOP_FOOTER = "🍋 Lemon Service • Secure Auto System"
 
 
 def make_embed(
@@ -2611,7 +2611,7 @@ def build_panel_banner(language="vi"):
         box = draw.textbbox((0, 0), "LEMON ", font=title_font)
         draw.text(
             (title_x + (box[2] - box[0]), title_y),
-            "COOKIE",
+            "SERVICE",
             font=title_font,
             fill=(255, 255, 255),
         )
@@ -3437,7 +3437,7 @@ def get_user_orders(user_id, limit=10):
 # =========================================================
 
 VI_TEXT = {
-    "panel_title": "🍋 Lemon Cookie • Cửa Hàng Account",
+    "panel_title": "🍋 Lemon Service • Cửa Hàng Account",
     "in_stock": "🟢 **CÒN HÀNG**",
     "out_stock": "🔴 **HẾT HÀNG**",
     "pricing": "💰 **BẢNG GIÁ**",
@@ -3460,7 +3460,7 @@ VI_TEXT = {
 }
 
 EN_TEXT = {
-    "panel_title": "🍋 Lemon Cookie • Account Shop",
+    "panel_title": "🍋 Lemon Service • Account Shop",
     "in_stock": "🟢 **IN STOCK**",
     "out_stock": "🔴 **OUT OF STOCK**",
     "pricing": "💰 **PRICING**",
@@ -5404,7 +5404,7 @@ def build_help_embed(language="vi"):
 
     if lang == "en":
         embed = make_embed(
-            "🍋 Lemon Cookie • Help",
+            "🍋 Lemon Service • Help",
             "Here are all available commands and their functions.",
             UI_BLUE
         )
@@ -5456,12 +5456,12 @@ def build_help_embed(language="vi"):
         )
 
         embed.set_footer(
-            text="🍋 Lemon Cookie • Use /help anytime to view this guide"
+            text="🍋 Lemon Service • Use /help anytime to view this guide"
         )
 
     else:
         embed = make_embed(
-            "🍋 Lemon Cookie • Trợ Giúp",
+            "🍋 Lemon Service • Trợ Giúp",
             "Danh sách tất cả lệnh hiện có và tác dụng của từng lệnh.",
             UI_BLUE
         )
@@ -5511,7 +5511,7 @@ def build_help_embed(language="vi"):
         )
 
         embed.set_footer(
-            text="🍋 Lemon Cookie • Dùng /help bất cứ lúc nào để xem hướng dẫn"
+            text="🍋 Lemon Service • Dùng /help bất cứ lúc nào để xem hướng dẫn"
         )
 
     return embed
@@ -7244,9 +7244,9 @@ async def profile(
         pick(
             lang,
             f"Chào mừng **{interaction.user.display_name}**.\n\n"
-            "Thông tin tài khoản Lemon Cookie của bạn:",
+            "Thông tin tài khoản Lemon Service của bạn:",
             f"Welcome, **{interaction.user.display_name}**.\n\n"
-            "Your Lemon Cookie account information is shown below."
+            "Your Lemon Service account information is shown below."
         ),
         UI_BLUE
     )
@@ -8177,7 +8177,7 @@ async def on_interaction(interaction: discord.Interaction):
 
 
 # =========================================================
-# TICKET SYSTEM (merged from the Lemon Cookie ticket bot)
+# TICKET SYSTEM (merged from the Lemon Service ticket bot)
 # =========================================================
 
 # =========================================================
@@ -8189,7 +8189,7 @@ TICKETS_FILE = os.path.join(BASE_DIR, "tickets.json")
 TICKET_CATEGORY_ID = 1551783945383710843
 STAFF_ROLE_ID = 1551564751052738640
 
-BOT_NAME = "Lemon Cookie"
+BOT_NAME = "Lemon Service"
 
 BOT_COLOR = discord.Color.from_rgb(
     255,
@@ -8319,14 +8319,14 @@ TEXT = {
 
         "vietnamese": "🇻🇳 Tiếng Việt",
 
-        "panel_title": "🍋 LEMON COOKIE",
+        "panel_title": "🍋 LEMON SERVICE",
 
         "panel_description": (
             "### 🎫 Support Center\n\n"
 
             "Cần hỗ trợ? Hãy tạo một ticket để "
             "liên hệ với đội ngũ "
-            "**Lemon Cookie Staff**.\n\n"
+            "**Lemon Service Staff**.\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━\n\n"
 
@@ -8357,7 +8357,7 @@ TEXT = {
         "support": "🛡️ Support",
 
         "support_value": (
-            "Lemon Cookie Staff\n"
+            "Lemon Service Staff\n"
             "Always here to help."
         ),
 
@@ -8369,7 +8369,7 @@ TEXT = {
         ),
 
         "panel_footer": (
-            "Lemon Cookie • Support Center"
+            "Lemon Service • Support Center"
         ),
 
         "language_changed_en": (
@@ -8426,7 +8426,7 @@ TEXT = {
             "Vui lòng gửi nội dung cần hỗ trợ "
             "tại đây.\n"
 
-            "Đội ngũ **Lemon Cookie Staff** sẽ "
+            "Đội ngũ **Lemon Service Staff** sẽ "
             "phản hồi sớm nhất có thể.\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -8632,7 +8632,7 @@ TEXT = {
         ),
 
         "panel_sent": (
-            "✅ Đã gửi **Lemon Cookie Ticket Panel**."
+            "✅ Đã gửi **Lemon Service Ticket Panel**."
         ),
 
         "generic_error": (
@@ -8649,13 +8649,13 @@ TEXT = {
 
         "vietnamese": "🇻🇳 Vietnamese",
 
-        "panel_title": "🍋 LEMON COOKIE",
+        "panel_title": "🍋 LEMON SERVICE",
 
         "panel_description": (
             "### 🎫 Support Center\n\n"
 
             "Need help? Create a ticket to contact "
-            "the **Lemon Cookie Staff** team.\n\n"
+            "the **Lemon Service Staff** team.\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━\n\n"
 
@@ -8684,7 +8684,7 @@ TEXT = {
         "support": "🛡️ Support",
 
         "support_value": (
-            "Lemon Cookie Staff\n"
+            "Lemon Service Staff\n"
             "Always here to help."
         ),
 
@@ -8696,7 +8696,7 @@ TEXT = {
         ),
 
         "panel_footer": (
-            "Lemon Cookie • Support Center"
+            "Lemon Service • Support Center"
         ),
 
         "language_changed_en": (
@@ -8755,7 +8755,7 @@ TEXT = {
 
             "Please describe your issue below.\n"
 
-            "The **Lemon Cookie Staff** team will "
+            "The **Lemon Service Staff** team will "
             "assist you as soon as possible.\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -8964,7 +8964,7 @@ TEXT = {
         ),
 
         "panel_sent": (
-            "✅ **Lemon Cookie Ticket Panel sent.**"
+            "✅ **Lemon Service Ticket Panel sent.**"
         ),
 
         "generic_error": (
@@ -9425,7 +9425,7 @@ def create_ticket_embed(
 
     embed.set_footer(
         text=(
-            "Lemon Cookie Support"
+            "Lemon Service Support"
         )
     )
 
@@ -9507,7 +9507,7 @@ def create_closed_embed(
     )
 
     embed.set_footer(
-        text="Lemon Cookie Support"
+        text="Lemon Service Support"
     )
 
     return embed
@@ -9894,7 +9894,7 @@ async def create_ticket_for_user(
             category=category,
             overwrites=overwrites,
             topic=(
-                f"Lemon Cookie Ticket | "
+                f"Lemon Service Ticket | "
                 f"User ID: {member.id}"
             ),
             reason=(
@@ -10770,7 +10770,7 @@ class ClosedTicketView(
         )
 
         embed.set_footer(
-            text="Lemon Cookie Support"
+            text="Lemon Service Support"
         )
 
         await interaction.response.send_message(
@@ -10833,7 +10833,7 @@ class ClosedTicketView(
         )
 
         embed.set_footer(
-            text="Lemon Cookie Support"
+            text="Lemon Service Support"
         )
 
         await interaction.response.send_message(
@@ -11075,7 +11075,7 @@ async def ticketinfo(
         )
 
     embed.set_footer(
-        text="Lemon Cookie Support"
+        text="Lemon Service Support"
     )
 
     await interaction.response.send_message(
@@ -11090,7 +11090,7 @@ async def ticketinfo(
 
 @bot.tree.command(
     name="ticketpanel",
-    description="Gửi panel tạo ticket Lemon Cookie"
+    description="Gửi panel tạo ticket Lemon Service"
 )
 async def ticketpanel(
     interaction: discord.Interaction
@@ -11326,7 +11326,7 @@ class VerifyView(discord.ui.View):
 
             await interaction.user.add_roles(
                 role,
-                reason="LEMON COOKIE verification"
+                reason="LEMON SERVICE verification"
             )
 
         except discord.Forbidden:
@@ -11370,7 +11370,7 @@ class VerifyView(discord.ui.View):
             )
 
         embed.set_footer(
-            text="🍋 LEMON COOKIE • Verification System"
+            text="🍋 LEMON SERVICE • Verification System"
         )
 
         await interaction.response.send_message(
@@ -12259,10 +12259,10 @@ async def verify(
             return
 
     embed = discord.Embed(
-        title="🍋 LEMON COOKIE",
+        title="🍋 LEMON SERVICE",
         description=(
             "## ✅ SERVER VERIFICATION\n\n"
-            "Welcome to **LEMON COOKIE**!\n\n"
+            "Welcome to **LEMON SERVICE**!\n\n"
             "Click the button below to verify yourself "
             "and gain access to the server.\n\n"
             "> 🔐 **Verification Required**\n"
@@ -12292,13 +12292,13 @@ async def verify(
         value=(
             "By verifying, you confirm that you agree "
             "to follow the rules and Terms of Service "
-            "of **LEMON COOKIE**."
+            "of **LEMON SERVICE**."
         ),
         inline=False
     )
 
     embed.set_footer(
-        text="🍋 LEMON COOKIE • Verification System"
+        text="🍋 LEMON SERVICE • Verification System"
     )
 
     try:

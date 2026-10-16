@@ -1,4 +1,4 @@
-# Lemon Cookie — bot Discord dùng SQLite
+# Lemon Service — bot Discord dùng SQLite
 
 **Bản vận hành 24/24:** xem [WINDOWS_VPS.md](WINDOWS_VPS.md) để nâng cấp, cấu hình
 server/admin, chạy tự động trên VPS Windows, sao lưu/khôi phục và đối soát thanh toán.
