@@ -230,6 +230,77 @@ class BotSQLiteTests(unittest.TestCase):
             self.bot.update_stock_message.assert_not_awaited()
         asyncio.run(scenario())
 
+    def test_removestock_removes_tail_and_preserves_financial_state(self):
+        async def scenario():
+            interaction = self.upload_interaction()
+            await self.bot.removestock.callback(interaction, 'default', 1)
+            self.assertEqual(self.bot.load_stock(), ['account1:pass1'])
+            self.assertEqual(self.bot.get_user_balance(42), 10000)
+            self.assertEqual(self.bot.load_orders(), {})
+            fields = interaction.followup.send.call_args.kwargs['embed'].fields
+            self.assertEqual([field.value for field in fields], ['1', '1'])
+            self.assertTrue(interaction.followup.send.call_args.kwargs['ephemeral'])
+            self.bot.update_stock_message.assert_awaited_once()
+            logs = str(self.bot.load_activity_logs())
+            self.assertIn('admin_remove_stock', logs)
+            self.assertNotIn('pass2', logs)
+        asyncio.run(scenario())
+
+    def test_removestock_extra_product_clear_and_permissions(self):
+        _, product, _ = self.bot.add_or_update_product('Extra stock', 2000, 3)
+        self.bot.save_product_stock(product, ['x:pass', 'y:pass'])
+        async def scenario():
+            interaction = self.upload_interaction()
+            choices = await self.bot.removestock_product_autocomplete(interaction, 'extra')
+            self.assertEqual([choice.value for choice in choices], [product['id']])
+            await self.bot.removestock.callback(interaction, product['id'], 2)
+            self.assertEqual(self.bot.load_product_stock(product), [])
+            self.assertEqual(len(self.bot.load_stock()), 2)
+            self.assertIsNotNone(self.bot.get_product_by_id(product['id']))
+            self.assertTrue(self.bot.removestock.guild_only)
+            interaction.permissions.administrator = False
+            self.assertEqual(await self.bot.removestock_product_autocomplete(interaction, ''), [])
+            with self.assertRaises(self.bot.app_commands.MissingPermissions):
+                for check in self.bot.removestock.checks:
+                    await check(interaction)
+        asyncio.run(scenario())
+
+    def test_removestock_rejects_invalid_quantities_and_product(self):
+        async def scenario():
+            for product, quantity in [('default', 0), ('default', -1), ('default', 3), ('missing', 1)]:
+                interaction = self.upload_interaction()
+                await self.bot.removestock.callback(interaction, product, quantity)
+                self.assertEqual(self.bot.load_stock(), ['account1:pass1', 'account2:pass2'])
+            self.bot.save_stock([])
+            await self.bot.removestock.callback(self.upload_interaction(), 'default', 1)
+            self.assertEqual(self.bot.load_stock(), [])
+            self.bot.update_stock_message.assert_not_awaited()
+        asyncio.run(scenario())
+
+    def test_removestock_concurrent_requests_cannot_overdraw_stock(self):
+        async def scenario():
+            interactions = [self.upload_interaction(), self.upload_interaction()]
+            await asyncio.gather(*(self.bot.removestock.callback(interaction, 'default', 2) for interaction in interactions))
+            self.assertEqual(self.bot.load_stock(), [])
+            successes = sum('embed' in interaction.followup.send.call_args.kwargs for interaction in interactions)
+            self.assertEqual(successes, 1)
+        asyncio.run(scenario())
+
+    def test_removestock_storage_failure_rolls_back(self):
+        original = self.bot.save_product_stock
+        def fail(product, stock):
+            original(product, stock)
+            raise OSError('injected deletion write failure')
+        self.bot.save_product_stock = fail
+        async def scenario():
+            interaction = self.upload_interaction()
+            with self.assertRaises(OSError):
+                await self.bot.removestock.callback(interaction, 'default', 1)
+            self.assertEqual(self.bot.load_stock(), ['account1:pass1', 'account2:pass2'])
+            interaction.followup.send.assert_not_awaited()
+            self.bot.update_stock_message.assert_not_awaited()
+        asyncio.run(scenario())
+
 
 if __name__ == '__main__':
     unittest.main()

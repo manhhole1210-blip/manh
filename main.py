@@ -5357,6 +5357,7 @@ def build_help_embed(language="vi"):
             name="🔐 Administrator Commands",
             value=(
                 "`/addstock <product> <file>` — Upload UTF-8 TXT stock (admin only).\n"
+                "`/removestock <product> <quantity>` — Remove accounts from the end of stock.\n"
                 "`/addbalance <user> <amount>` — Add VND balance to a user.\n"
                 "`/removebalance <user> <amount>` — Remove VND balance from a user.\n"
                 "`/warranty <order_id>` — Check warranty details for an order as an administrator.\n"
@@ -5409,6 +5410,7 @@ def build_help_embed(language="vi"):
             name="🔐 Lệnh dành cho Administrator",
             value=(
                 "`/addstock <product> <file>` — Chọn sản phẩm và nhập kho từ TXT.\n"
+                "`/removestock <product> <quantity>` — Xóa account từ cuối kho.\n"
                 "`/addbalance <user> <amount>` — Cộng số dư VND cho người dùng.\n"
                 "`/removebalance <user> <amount>` — Trừ số dư VND của người dùng.\n"
                 "`/warranty <order_id>` — Kiểm tra chi tiết bảo hành đơn hàng với quyền Admin.\n"
@@ -6572,6 +6574,67 @@ async def addstock_product_autocomplete(interaction: discord.Interaction, curren
     return [app_commands.Choice(name=item["name"][:100], value=item["id"])
             for item in get_all_products()
             if not query or query in item["name"].casefold() or query in item["id"].casefold()][:25]
+
+
+# =========================================================
+# /REMOVESTOCK
+# =========================================================
+
+@tree.command(name="removestock", description="Admin: remove a quantity of accounts from the end of a product's stock")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(product="Choose the product", quantity="Number of accounts to remove from the end of stock")
+async def removestock(interaction: discord.Interaction, product: str, quantity: app_commands.Range[int, 1]):
+    lang = get_user_language(interaction.user.id)
+    target = find_product_by_query(product)
+    if target is None or quantity <= 0:
+        await interaction.response.send_message(
+            pick(lang, "❌ Chọn sản phẩm hợp lệ và số lượng lớn hơn 0.",
+                 "❌ Select a valid product and a quantity greater than zero."), ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    error = None
+    async with SHOP_TRANSACTION_LOCK:
+        target = get_product_by_id(target["id"])
+        if target is None:
+            error = pick(lang, "❌ Sản phẩm không còn tồn tại. Kho chưa thay đổi.",
+                         "❌ The product no longer exists. Stock is unchanged.")
+        else:
+            with data_transaction():
+                stock = load_product_stock(target)
+                if quantity > len(stock):
+                    error = pick(lang, f"❌ Kho chỉ còn {len(stock):,} account. Chưa xóa account nào.",
+                                 f"❌ Only {len(stock):,} accounts remain. No accounts were removed.")
+                else:
+                    remaining = stock[:-quantity]
+                    save_product_stock(target, remaining)
+                    log_activity(interaction.user.id, interaction.user.name, "admin_remove_stock", {
+                        "product_id": target["id"], "quantity": quantity,
+                        "stock_before": len(stock), "stock_after": len(remaining)
+                    }, "command")
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    embed = make_embed(
+        pick(lang, "📦 Đã xóa khỏi kho", "📦 Stock Removed"),
+        discord.utils.escape_markdown(target["name"]), UI_GREEN)
+    embed.add_field(name=pick(lang, "Đã xóa từ cuối kho", "Removed from end of stock"),
+                    value=f"{quantity:,}", inline=True)
+    embed.add_field(name=pick(lang, "Tồn kho còn lại", "Remaining stock"),
+                    value=f"{len(remaining):,}", inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    try:
+        await update_stock_message()
+    except Exception as exc:
+        print(f"[STOCK] Removal panel refresh error ({type(exc).__name__})")
+
+
+@removestock.autocomplete("product")
+async def removestock_product_autocomplete(interaction: discord.Interaction, current: str):
+    return await addstock_product_autocomplete(interaction, current)
 
 
 # =========================================================

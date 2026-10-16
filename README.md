@@ -84,6 +84,16 @@ transaction SQLite. Nhật ký chỉ chứa ID sản phẩm và số lượng, k
 
 Sau khi cập nhật `main.py`, khởi động lại bot và chờ đồng bộ lệnh để thấy `/addstock`.
 
+### Xóa bớt tồn kho trên Discord
+
+Dùng `/removestock`, chọn `product` và nhập `quantity` là số account cần xóa.
+Lệnh dành cho Administrator trong server, xóa từ **cuối kho** để giữ nguyên thứ tự
+những account đầu kho đang chờ bán. Muốn xóa hết, nhập số lượng bằng tồn kho hiện tại.
+Nếu số lượng vượt tồn kho hoặc sản phẩm không còn tồn tại, không xóa account nào.
+Lệnh không xóa sản phẩm, không đổi số dư, đơn đã bán hoặc tổng số đã bán. Kết quả
+riêng tư báo số đã xóa và số còn lại; panel được cập nhật sau khi lưu SQLite thành công.
+Xóa kho dùng cùng khóa với mua hàng/nhập kho và có rollback khi lỗi ghi dữ liệu.
+
 ### Qua dòng lệnh
 
 Dừng bot. Đặt mỗi account trên một dòng trong `input/new_accounts.txt`, sau đó:
