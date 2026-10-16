@@ -274,7 +274,8 @@ class SQLiteStore:
                         updated['tiers'] = tier_prices(updated['tiers'])
                 changes.append((self.root / key, updated))
             except ValueError:
-                raise ValueError(f'Invalid/fractional VND in {key}; reconcile it before upgrading. No balances were changed') from None
+                hint = ' Run: python manage_bot.py check-money.' if key == 'data/users.json' else ''
+                raise ValueError(f'Invalid/fractional VND in {key}; reconcile it before upgrading. No balances were changed.' + hint) from None
         from operations import snapshot_database, utc_stamp
         snapshot_database(self.path, self.root / 'backups' / f'pre-integer-vnd-{utc_stamp()}.db')
         with self.transaction():

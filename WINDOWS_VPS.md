@@ -27,6 +27,18 @@ nâng cấp dừng, chỉ rõ tài liệu chứa lỗi để đối chiếu. Nh�
 trường lịch sử sang số nguyên. Không tự làm tròn hoặc xóa sổ cái. Riêng quy đổi crypto dùng Decimal và quy tắc
 làm tròn nửa lên (ROUND_HALF_UP) đến một đồng; số tiền USD được lưu dạng chuỗi thập phân.
 
+Nếu thông báo nâng cấp chỉ đến `data/users.json`, chạy lệnh chỉ đọc:
+
+```bat
+.venv\Scripts\python.exe manage_bot.py check-money
+```
+
+Lệnh chỉ in ID và giá trị số dư cần đối chiếu (lẻ, âm, vượt giới hạn hoặc không phải
+số), không in username/token và không sửa dữ liệu. Đối chiếu lịch sử mua/nạp và backup
+để xác định số dư đúng trước khi điều chỉnh; không xóa database hoặc thay toàn bộ
+users.json bằng `{}`. Bot đã nhập dữ liệu vào SQLite thì sửa JSON cũ không thay đổi
+số dư hiện tại.
+
 ## Cấu hình quyền và cảnh báo
 
 Bật Developer Mode trong Discord, nhấp phải server/người dùng/kênh để Copy ID.

@@ -83,6 +83,27 @@ class OperationsTests(unittest.TestCase):
                 self.assertEqual(self.store.load_json(self.root / key, None), value)
                 self.store.delete(self.root / key)
 
+    def test_live_balance_diagnostic_is_read_only_and_identifies_reasons(self):
+        from manage_bot import check_user_balances
+        path = self.root / 'data/users.json'
+        original = {
+            '42': {'balance': 100.5, 'username': 'do-not-print'},
+            '43': {'balance': -3},
+            '44': {'balance': 'not-a-number'},
+            '45': {'balance': 1000.0},
+        }
+        self.store.save_json(path, original)
+        checked, issues = check_user_balances(self.root)
+        self.assertEqual(checked, 4)
+        self.assertEqual([item[0] for item in issues], ['42', '43', '44'])
+        self.assertIn('fractional', issues[0][1])
+        self.assertEqual(issues[0][2], '100.5')
+        self.assertIn('negative', issues[1][1])
+        self.assertIsNone(issues[2][2])
+        self.assertNotIn('do-not-print', str(issues))
+        self.assertEqual(self.store.load_json(path, {}), original)
+        self.assertIsNone(self.store.db.execute("SELECT 1 FROM metadata WHERE key='integer_vnd_v1'").fetchone())
+
     def test_policy_requires_guild_id_admin_id_and_permission(self):
         policy = RuntimePolicy(self.root)
         policy.config.update(allowed_guild_ids=[123], admin_user_ids=[42])
