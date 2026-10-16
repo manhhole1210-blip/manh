@@ -1,10 +1,14 @@
 import json
+import os
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from sqlite_store import SQLiteStore
+from sqlite_store import SQLiteStore, acquire_process_lock, read_legacy_json
 
 
 class StoreTests(unittest.TestCase):
@@ -124,6 +128,35 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Invalid legacy'):
             self.store.migrate()
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM metadata').fetchone()[0], 0)
+
+    def test_error_names_file_without_exposing_its_contents(self):
+        path = self.root / 'data/config.json'
+        path.write_text('{"private_field": test_private_value}')
+        with self.assertRaises(json.JSONDecodeError) as raised:
+            self.store.migrate()
+        message = str(raised.exception)
+        self.assertIn(str(path), message)
+        self.assertIn('line 1 column', message)
+        self.assertNotIn('test_private_value', message)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM metadata').fetchone()[0], 0)
+
+    def test_windows_utf8_bom_import(self):
+        path = self.root / 'data/users.json'
+        path.write_bytes(b'\xef\xbb\xbf' + b'{"42":{"balance":123}}')
+        self.store.migrate()
+        self.assertEqual(self.store.load_json(path, {})['42']['balance'], 123)
+        self.assertTrue(path.read_bytes().startswith(b'\xef\xbb\xbf'))
+
+    def test_windows_process_lock_branch(self):
+        windows = SimpleNamespace(name='nt', fstat=os.fstat)
+        msvcrt = SimpleNamespace(LK_NBLCK=2, locking=Mock())
+        with patch('sqlite_store.os', windows), patch.dict(sys.modules, {'msvcrt': msvcrt}):
+            handle = acquire_process_lock(self.root / 'data')
+        try:
+            msvcrt.locking.assert_called_once_with(handle.fileno(), 2, 1)
+            self.assertEqual((self.root / 'data/.bot.lock').read_bytes(), b'\0')
+        finally:
+            handle.close()
 
     def test_outside_path_rejected(self):
         with self.assertRaises(ValueError):

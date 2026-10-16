@@ -105,17 +105,12 @@ DEFAULT_CRYPTO_CONFIG = {
 
 # SQLite transactions keep balance, stock and order updates atomic.
 # The old redo journal reader is retained only for first-run migration.
-# Run one bot process per data directory; the process lock enforces this on Linux.
+# Hold the same cross-platform lock used by the SQLite maintenance CLI.
+from sqlite_store import SQLiteStore, acquire_process_lock, read_legacy_json
 try:
-    import fcntl
-except ImportError:
-    fcntl = None
-_PROCESS_LOCK = open(os.path.join(DATA_DIR, ".bot.lock"), "a")
-if fcntl is not None:
-    try:
-        fcntl.flock(_PROCESS_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        raise RuntimeError("Another bot is already using this data directory") from exc
+    _PROCESS_LOCK = acquire_process_lock(DATA_DIR)
+except OSError as exc:
+    raise RuntimeError("Cannot lock data directory; stop other bot processes and check permissions") from exc
 
 _JOURNAL_FILE = os.path.join(DATA_DIR, "transaction_journal.json")
 
@@ -158,8 +153,7 @@ def _delete_stock_file(path):
 def _recover_transaction():
     if not os.path.exists(_JOURNAL_FILE):
         return
-    with open(_JOURNAL_FILE, encoding="utf-8") as handle:
-        writes = json.load(handle)
+    writes = read_legacy_json(_JOURNAL_FILE)
     if not isinstance(writes, dict):
         raise ValueError("Invalid transaction journal; restore from backup")
     # Validate the entire journal before applying any operation. null means delete.
@@ -182,8 +176,6 @@ def _recover_transaction():
 
 # Replay an old redo journal before importing the legacy ledger.
 _recover_transaction()
-
-from sqlite_store import SQLiteStore
 
 STORE = SQLiteStore(BASE_DIR)
 _legacy_backup = STORE.migrate()
@@ -219,8 +211,7 @@ def load_json(path, default):
     # Payment credentials remain in the existing private configuration file.
     if os.path.abspath(path) == os.path.abspath(CRYPTO_CONFIG_FILE):
         try:
-            with open(path, encoding="utf-8") as handle:
-                return json.load(handle)
+            return read_legacy_json(path)
         except FileNotFoundError:
             return copy.deepcopy(default)
     return STORE.load_json(path, default)

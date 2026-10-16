@@ -4,7 +4,7 @@ Bản chuyển đổi từ `main.py` được cung cấp. Giữ các lệnh shop
 ticket và thông báo. Database được tạo tại `data/bot.db`; dùng `sqlite3` có
 sẵn trong Python, không cần cài máy chủ SQLite hay thư viện database riêng.
 
-## Cài đặt và chuyển dữ liệu (Linux, Python 3.10+)
+## Cài đặt và chuyển dữ liệu (Windows/Linux, Python 3.10+)
 
 1. **Dừng bot cũ** và sao lưu toàn bộ thư mục đang chạy, kể cả token/config riêng.
 2. Đặt `main.py`, `sqlite_store.py`, `requirements.txt` cạnh nhau **trong thư mục
@@ -17,6 +17,30 @@ sẵn trong Python, không cần cài máy chủ SQLite hay thư viện database
    .venv/bin/python -m pip install -r requirements.txt
    .venv/bin/python main.py
    ```
+
+Trên Windows CMD, vào thư mục bot rồi dùng các lệnh sau thay cho lệnh Linux:
+
+```bat
+py -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe main.py
+```
+
+Với các lệnh công cụ ở dưới, thay `.venv/bin/python` bằng
+`.venv\Scripts\python.exe` trên Windows. Khóa tiến trình dùng `msvcrt` trên
+Windows và `fcntl` trên Linux.
+
+Nếu báo lỗi JSON, kiểm tra dữ liệu mà không sửa tệp hoặc tạo database:
+
+```bat
+.venv\Scripts\python.exe check_data.py
+```
+
+Công cụ in tên tệp lỗi và số dòng/cột, không in nội dung hoặc token. Sao lưu tệp
+được báo lỗi trước khi sửa cú pháp JSON; không thay tệp số dư/đơn hàng bằng `{}`
+hoặc `[]`. Có hỗ trợ UTF-8 BOM thường gặp khi lưu tệp trên Windows. JSON sai cú
+pháp vẫn bị từ chối để bảo toàn dữ liệu. Đừng gửi token/API key hoặc thông tin
+account khi nhờ kiểm tra lỗi.
 
 Token Discord đọc từ biến `DISCORD_BOT_TOKEN`, hoặc `input/token.txt` như trước.
 Token ngân hàng đọc từ `VCB_API_TOKEN`, hoặc `apinaptien/token.txt`.

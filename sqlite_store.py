@@ -9,6 +9,43 @@ from datetime import datetime
 from pathlib import Path
 
 
+def read_legacy_json(path):
+    """Read Windows UTF-8/BOM exports; errors identify files, never print contents."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding='utf-8-sig')
+    except UnicodeError:
+        raise ValueError(f'Invalid UTF-8 encoding in {path}; save a copy as UTF-8 before retrying') from None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise json.JSONDecodeError(
+            f'Invalid JSON in {path}: {exc.msg}. Back up and repair this file; no legacy data was imported',
+            exc.doc, exc.pos) from None
+
+
+def acquire_process_lock(data_dir):
+    """Hold the returned file open to lock one bot/maintenance process."""
+    directory = Path(data_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = open(directory / '.bot.lock', 'a+b')
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b'\0')
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
 class SQLiteStore:
     # Keep each customer/order separately queryable while preserving legacy fields.
     ENTITY_TABLES = {
@@ -144,7 +181,7 @@ class SQLiteStore:
         decoded = {}
         for path in paths:
             self.key(path)  # Reject symlinks that escape the application directory.
-            decoded[path] = json.loads(path.read_text(encoding='utf-8')) if path.suffix == '.json' else path.read_bytes()
+            decoded[path] = read_legacy_json(path) if path.suffix == '.json' else path.read_bytes()
             key = self.key(path)
             expected = {
                 'data/users.json': dict, 'data/orders.json': dict,
@@ -218,14 +255,10 @@ def main():
     # Mutating maintenance must not race the running bot's in-memory ledger.
     lock = None
     if not args.backup:
-        import fcntl
-        (args.root / 'data').mkdir(parents=True, exist_ok=True)
-        lock = open(args.root / 'data/.bot.lock', 'a')
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock = acquire_process_lock(args.root / 'data')
         except OSError:
-            lock.close()
-            parser.error('Stop the bot before migration or stock import')
+            parser.error('Cannot acquire data lock; stop the bot and check directory permissions')
     if args.backup and not (args.root / 'data/bot.db').is_file():
         parser.error('No existing database to back up')
     store = SQLiteStore(args.root)
