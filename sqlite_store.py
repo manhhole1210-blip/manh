@@ -65,6 +65,15 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS documents (path TEXT PRIMARY KEY, payload TEXT NOT NULL CHECK(json_valid(payload)));
             CREATE TABLE IF NOT EXISTS processed_transactions (transaction_id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS payment_claims (provider TEXT, payment_id TEXT, PRIMARY KEY(provider,payment_id));
+            CREATE TABLE IF NOT EXISTS bank_payments (
+                transaction_id TEXT PRIMARY KEY, amount_vnd INTEGER NOT NULL CHECK(amount_vnd>0),
+                description TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
+                user_id TEXT, actor_id TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS deliveries (
+                order_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT, message_id TEXT);
             CREATE TABLE IF NOT EXISTS stock (path TEXT PRIMARY KEY, content BLOB NOT NULL);
         ''')
         for table in self.ENTITY_TABLES.values():
@@ -208,6 +217,82 @@ class SQLiteStore:
             self.db.execute("INSERT INTO metadata VALUES ('legacy_import_v1', ?)", (datetime.now().isoformat(),))
         return backup
 
+    def upgrade_vnd(self):
+        from money import vnd
+        if self.db.execute("SELECT 1 FROM metadata WHERE key='integer_vnd_v1'").fetchone():
+            return
+        fields = {'balance', 'unit_price', 'total', 'credit_vnd', 'amount_vnd',
+                  'old_balance', 'new_balance', 'balance_before', 'balance_after', 'price', 'price_tier_1', 'price_tier_2', 'price_tier_3', 'price_tier_4'}
+        def convert(value):
+            if isinstance(value, dict):
+                return {k: vnd(v) if k in fields and v is not None else convert(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [convert(item) for item in value]
+            return value
+        changes = []
+        for key, payload in self.db.execute('SELECT path, payload FROM documents').fetchall():
+            value = self.load_json(self.root / key, None)
+            if key == 'data/balance_dm.json' and isinstance(value, dict):
+                value = {k: {**item, 'amount': vnd(item['amount'])} if isinstance(item, dict) and 'amount' in item else item for k, item in value.items()}
+            try:
+                changes.append((self.root / key, convert(value)))
+            except ValueError:
+                raise ValueError(f'Invalid/fractional VND in {key}; reconcile it before upgrading. No balances were changed') from None
+        from operations import snapshot_database, utc_stamp
+        snapshot_database(self.path, self.root / 'backups' / f'pre-integer-vnd-{utc_stamp()}.db')
+        with self.transaction():
+            for path, value in changes:
+                self.save_json(path, value)
+            for order in self.load_json(self.root / 'data/crypto_orders.json', {}).values():
+                if order.get('credited') and order.get('trans_id'):
+                    self.db.execute('INSERT OR IGNORE INTO payment_claims VALUES (?,?)', ('crypto', str(order['trans_id'])))
+            self.db.execute("INSERT INTO metadata VALUES ('integer_vnd_v1', '1')")
+
+    def payments_paused(self):
+        row = self.db.execute("SELECT value FROM metadata WHERE key='payments_paused_after_restore'").fetchone()
+        return row is not None and row[0] == '1'
+
+    def claim_crypto_payment(self, payment_id):
+        return self.db.execute('INSERT OR IGNORE INTO payment_claims VALUES (?,?)', ('crypto', str(payment_id))).rowcount == 1
+
+    def observe_bank_payment(self, transaction_id, amount, description, reason):
+        from money import vnd
+        self.db.execute('INSERT OR IGNORE INTO bank_payments VALUES (?,?,?,?,?,?,?,?)',
+            (str(transaction_id), vnd(amount), str(description)[:1000], 'pending', reason, None, None, datetime.now().isoformat()))
+        return self.bank_payment(transaction_id)
+
+    def bank_payment(self, transaction_id):
+        self.db.row_factory = sqlite3.Row
+        try:
+            row = self.db.execute('SELECT * FROM bank_payments WHERE transaction_id=?', (str(transaction_id),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            self.db.row_factory = None
+
+    def pending_bank_payments(self, limit=10):
+        rows = self.db.execute("SELECT transaction_id FROM bank_payments WHERE status='pending' ORDER BY created_at LIMIT ?", (limit,)).fetchall()
+        return [self.bank_payment(row[0]) for row in rows]
+
+    def settle_bank_payment(self, transaction_id, status, user_id, actor_id):
+        changed = self.db.execute("UPDATE bank_payments SET status=?, user_id=?, actor_id=? WHERE transaction_id=? AND status='pending'",
+                                 (status, str(user_id) if user_id is not None else None, str(actor_id), str(transaction_id))).rowcount
+        if changed != 1:
+            raise ValueError('Payment is no longer pending')
+
+    def enqueue_delivery(self, order_id, user_id):
+        self.db.execute("INSERT OR IGNORE INTO deliveries(order_id,user_id,status,attempts,next_attempt_at) VALUES (?,?,'pending',0,0)", (order_id, str(user_id)))
+
+    def delivery(self, order_id):
+        row = self.db.execute('SELECT order_id,user_id,status,attempts,next_attempt_at,last_error,message_id FROM deliveries WHERE order_id=?', (order_id,)).fetchone()
+        return dict(zip(('order_id','user_id','status','attempts','next_attempt_at','last_error','message_id'), row)) if row else None
+
+    def delivery_pending(self, order_id):
+        row = self.delivery(order_id)
+        return row is not None and row['status'] != 'sent'
+
+    def due_deliveries(self, now):
+        return [row[0] for row in self.db.execute("SELECT order_id FROM deliveries WHERE status IN ('pending','failed','sending') AND next_attempt_at<=? AND attempts<5 ORDER BY next_attempt_at LIMIT 10", (now,))]
+
     def import_stock(self, source, product_id='default'):
         lines = [line.strip() for line in Path(source).read_text(encoding='utf-8-sig').splitlines() if line.strip()]
         if not lines:
@@ -234,13 +319,13 @@ class SQLiteStore:
         return len(lines)
 
     def backup(self, target):
+        from operations import snapshot_database
         target = Path(target).resolve()
         if target.exists() or target == self.path:
             raise ValueError('Choose a new backup filename')
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(target) as dest:
-            self.db.backup(dest)
-        os.chmod(target, 0o600)
+        if self.db.in_transaction:
+            raise ValueError('Back up only committed transactions')
+        return snapshot_database(self.path, target)
 
     def close(self):
         self.db.close()

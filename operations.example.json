@@ -1,0 +1,12 @@
+{
+  "allowed_guild_ids": [],
+  "admin_user_ids": [920604650602909767, 909652269723693077],
+  "alert_channel_id": 0,
+  "bootstrap_from_stock_channel": true,
+  "backup_interval_hours": 6,
+  "backup_keep": 28,
+  "bank_failure_threshold": 3,
+  "alert_repeat_seconds": 3600,
+  "bank_poll_seconds": 30,
+  "crypto_poll_seconds": 30
+}

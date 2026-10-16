@@ -9,3 +9,5 @@ backups/
 tickets.json
 user_languages.json
 config.json
+operations.json
+logs/

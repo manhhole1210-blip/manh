@@ -20,6 +20,8 @@ class BotSQLiteTests(unittest.TestCase):
         self.bot = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.bot)
         self.user = SimpleNamespace(id=42, name='buyer', display_name='Buyer', mention='<@42>', send=AsyncMock())
+        self.bot.POLICY.config.update(allowed_guild_ids=[123], admin_user_ids=[42], bootstrap_from_stock_channel=False)
+        self.bot.POLICY.save()
         self.bot.ensure_user(self.user)
         self.bot.users['42']['balance'] = 10000
         self.bot.save_json(self.bot.USERS_FILE, self.bot.users)
@@ -34,7 +36,7 @@ class BotSQLiteTests(unittest.TestCase):
         self.temp.cleanup()
 
     def interaction(self):
-        return SimpleNamespace(user=self.user,
+        return SimpleNamespace(user=self.user, guild=SimpleNamespace(id=123), permissions=SimpleNamespace(administrator=True),
             response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
             followup=SimpleNamespace(send=AsyncMock()), edit_original_response=AsyncMock())
 
@@ -147,7 +149,7 @@ class BotSQLiteTests(unittest.TestCase):
             interaction.permissions.administrator = False
             self.assertEqual(await self.bot.addstock_product_autocomplete(interaction, ''), [])
             self.assertTrue(self.bot.addstock.guild_only)
-            with self.assertRaises(self.bot.app_commands.MissingPermissions):
+            with self.assertRaises(self.bot.app_commands.CheckFailure):
                 for check in self.bot.addstock.checks:
                     await check(interaction)
         asyncio.run(scenario())
@@ -260,7 +262,7 @@ class BotSQLiteTests(unittest.TestCase):
             self.assertTrue(self.bot.removestock.guild_only)
             interaction.permissions.administrator = False
             self.assertEqual(await self.bot.removestock_product_autocomplete(interaction, ''), [])
-            with self.assertRaises(self.bot.app_commands.MissingPermissions):
+            with self.assertRaises(self.bot.app_commands.CheckFailure):
                 for check in self.bot.removestock.checks:
                     await check(interaction)
         asyncio.run(scenario())

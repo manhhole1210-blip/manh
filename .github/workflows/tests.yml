@@ -1,0 +1,36 @@
+name: Bot tests
+on:
+  push:
+    branches: [main, sqlite-migration]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+      - name: Parse Windows installation scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($Script in @('install-windows.ps1', 'uninstall-windows.ps1')) {
+            $Tokens = $null
+            $ParserErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $Script), [ref]$Tokens, [ref]$ParserErrors) | Out-Null
+            if ($ParserErrors.Count -gt 0) { throw ($ParserErrors | Out-String) }
+          }

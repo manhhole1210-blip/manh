@@ -4,6 +4,11 @@ from discord.ext import commands, tasks
 from discord.ui import Modal, TextInput, View, Button
 
 import asyncio
+import logging
+import time
+from pathlib import Path
+from money import vnd, crypto_to_vnd
+from operations import RuntimePolicy, rotating_backup
 import io
 import json
 import os
@@ -177,10 +182,12 @@ def _recover_transaction():
 # Replay an old redo journal before importing the legacy ledger.
 _recover_transaction()
 
+POLICY = RuntimePolicy(BASE_DIR)
 STORE = SQLiteStore(BASE_DIR)
 _legacy_backup = STORE.migrate()
 if _legacy_backup:
     print(f"[SQLITE] Legacy backup: {_legacy_backup}")
+STORE.upgrade_vnd()
 
 
 @contextmanager
@@ -508,7 +515,7 @@ def clean_tiers(raw):
     by_qty = {}
     for item in raw:
         qty = int(item["min_qty"])
-        price = int(item["price"])
+        price = vnd(item["price"])
         if not 1 <= qty <= MAX_TIER_QUANTITY:
             raise ValueError(f"min_qty out of range: {qty}")
         if not 1 <= price <= MAX_PRICE_PER_ACCOUNT:
@@ -1258,10 +1265,7 @@ def ensure_user(user):
 
 
 def get_user_balance(user_id):
-    value = Decimal(str(users.get(str(user_id), {}).get("balance", 0)))
-    if not value.is_finite() or value < 0:
-        raise ValueError("Invalid stored balance; reconcile the ledger before continuing")
-    return float(value)
+    return vnd(users.get(str(user_id), {}).get("balance", 0))
 
 
 # =========================================================
@@ -1284,11 +1288,11 @@ def add_topup_history(user_id, username, amount_vnd, method,
     items.append({
         "user_id": int(user_id),
         "username": str(username),
-        "amount_vnd": float(amount_vnd),
+        "amount_vnd": vnd(amount_vnd),
         "method": str(method),
         "transaction_id": str(transaction_id),
         "order_id": str(order_id),
-        "amount_usd": float(amount_usd) if amount_usd is not None else None,
+        "amount_usd": str(amount_usd) if amount_usd is not None else None,
         "status": str(status),
         "created_at": datetime.now().isoformat()
     })
@@ -1320,7 +1324,9 @@ def log_activity(user_id, username, action, details=None,
             logs[uid] = bucket[-10000:]
         save_json(ACTIVITY_LOG_FILE, logs)
     except Exception as e:
-        print(f"[AUDIT] Log error: {e}")
+        if STORE.db.in_transaction:
+            raise
+        print(f"[AUDIT] Log error ({type(e).__name__})")
 
 
 def get_activity_for_username(username):
@@ -1676,12 +1682,6 @@ def extract_transactions(payload):
 
     best = candidates[0]
 
-    print(
-        "[VCB] Best transaction list "
-        f"score={best[0]:.2f}, "
-        f"count={best[1]}"
-    )
-
     return best[2]
 
 
@@ -1870,309 +1870,116 @@ def is_outgoing_transaction(item):
 # =========================================================
 
 def fetch_vcb_history():
-
     if not VCB_API_TOKEN:
-
-        print(
-            "[VCB] Missing API token."
-        )
-
         return None
-
-    url = (
-        "https://api.sieuthicode.net/"
-        f"historyapivcb/{VCB_API_TOKEN}"
-    )
-
     try:
-
-        response = requests.get(
-            url,
-            timeout=20
-        )
-
-        print(
-            f"[VCB] HTTP {response.status_code}"
-        )
-
+        response = requests.get(f"https://api.sieuthicode.net/historyapivcb/{VCB_API_TOKEN}", timeout=20)
         response.raise_for_status()
-
-        try:
-
-            payload = response.json()
-
-        except Exception:
-
-            payload = json.loads(
-                response.text
-            )
-
-        if isinstance(
-            payload,
-            dict
-        ):
-
-            print(
-                "[VCB] Root keys:",
-                list(payload.keys())[:20]
-            )
-
+        payload = response.json()
+        if not isinstance(payload, (dict, list)):
+            return None
+        if isinstance(payload, dict) and str(payload.get('code', '00')).lower() not in ('00', '0', '200', 'success'):
+            return None
         return payload
-
-    except Exception as e:
-
-        print(
-            f"[VCB] Request failed ({type(e).__name__}); check credentials and connectivity"
-        )
-
+    except (requests.RequestException, ValueError):
         return None
 
 
-# =========================================================
-# PROCESS VCB
-# =========================================================
+def bank_transfer_code(description):
+    match = re.search(r"\bLC([A-Za-z0-9_.-]+)", description, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def credit_bank_payment(transaction_id, user_id, actor_id='bank', reason='automatic'):
+    payment = STORE.bank_payment(transaction_id)
+    user_id = str(user_id)
+    if payment is None or payment['status'] != 'pending' or user_id not in users:
+        raise ValueError('Payment is not pending or user does not exist')
+    amount = vnd(payment['amount_vnd'])
+    with data_transaction():
+        # Native unique ID is claimed before the balance changes, in the same commit.
+        if not mark_transaction_processed(transaction_id):
+            raise ValueError('Payment was already processed')
+        old = get_user_balance(user_id)
+        new = vnd(old + amount)
+        users[user_id]['balance'] = new
+        save_json(USERS_FILE, users)
+        STORE.settle_bank_payment(transaction_id, 'credited', user_id, actor_id)
+        add_topup_history(user_id, users[user_id].get('username', ''), amount, 'Vietcombank',
+                          transaction_id=transaction_id, status='completed')
+        log_activity(user_id, users[user_id].get('username', ''), 'topup_completed', {
+            'method': 'Vietcombank', 'amount_vnd': amount, 'transaction_id': transaction_id,
+            'balance_before': old, 'balance_after': new, 'actor_id': str(actor_id), 'reason': reason[:200]
+        }, 'bank')
+    return new
+
 
 async def process_bank_transactions():
-
-    payload = await asyncio.to_thread(
-        fetch_vcb_history
-    )
-
+    payload = await asyncio.to_thread(fetch_vcb_history)
     if payload is None:
+        await service_result('bank', False, 'unavailable_or_invalid_response')
         return
-
-    transaction_list = extract_transactions(
-        payload
-    )
-
-    print(
-        f"[TOPUP] Found "
-        f"{len(transaction_list)} transactions."
-    )
-
-    for item in transaction_list:
-
+    try:
+        items = extract_transactions(payload)
+    except (ValueError, TypeError, RecursionError):
+        await service_result('bank', False, 'invalid_response_structure')
+        return
+    await service_result('bank', True)
+    credited = 0
+    pending = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         try:
-
-            if not isinstance(
-                item,
-                dict
-            ):
+            transaction_id = parse_transaction_id(item)
+            if is_transaction_processed(transaction_id):
                 continue
-
-
-            transaction_id = parse_transaction_id(
-                item
-            )
-
-            amount = parse_amount(
-                item
-            )
-
-            description = parse_description(
-                item
-            )
-
-
-            print(
-                "[TOPUP] "
-                f"ID={transaction_id} | "
-                f"Amount={amount} | "
-                f"Description={description}"
-            )
-
-
-            if is_transaction_processed(
-                transaction_id
-            ):
-
-                print(
-                    "[TOPUP] Already processed: "
-                    f"{transaction_id}"
-                )
-
+            if is_outgoing_transaction(item):
+                async with SHOP_TRANSACTION_LOCK:
+                    with data_transaction():
+                        mark_transaction_processed(transaction_id)
                 continue
-
-
-            if is_outgoing_transaction(
-                item
-            ):
-
-                print(
-                    "[TOPUP] Outgoing -> skip."
-                )
-
-                mark_transaction_processed(
-                    transaction_id
-                )
-
-                continue
-
-
+            amount = vnd(parse_amount(item))
             if amount <= 0:
-
-                print(
-                    "[TOPUP] Invalid amount."
-                )
-
                 continue
-
-
-            match = re.search(
-                r"\bLC([A-Za-z0-9_.-]+)",
-                description,
-                re.IGNORECASE
-            )
-
-            if not match:
-
-                print(
-                    "[TOPUP] No LC code found."
-                )
-
-                continue
-
-
-            username = match.group(1)
-
-
-            print(
-                "[TOPUP] LC code found: "
-                f"{username}"
-            )
-
-
-            user_id = username if username.isdigit() and username in users else None
-
-            for uid, user_data in (() if user_id is not None else users.items()):
-
-                saved_username = str(
-                    user_data.get(
-                        "username",
-                        ""
-                    )
-                )
-
-                if (
-                    saved_username.lower()
-                    ==
-                    username.lower()
-                ):
-
-                    user_id = uid
-                    break
-
-
-            if user_id is None:
-
-                print(
-                    "[TOPUP] User not found: "
-                    f"{username}"
-                )
-
-                continue
-
-
-            with data_transaction():
-                old_balance = parse_number(
-                    users[user_id].get(
-                        "balance",
-                        0
-                    )
-                )
-
-                new_balance = (
-                    old_balance
-                    +
-                    amount
-                )
-
-                users[user_id]["balance"] = float(
-                    new_balance
-                )
-
-
-                save_json(
-                    USERS_FILE,
-                    users
-                )
-
-                mark_transaction_processed(
-                    transaction_id
-                )
-
-                add_topup_history(
-                    user_id,
-                    username,
-                    amount,
-                    "Vietcombank",
-                    transaction_id=transaction_id,
-                    status="completed"
-                )
-                log_activity(
-                    user_id,
-                    username,
-                    "topup_completed",
-                    {
-                        "method": "Vietcombank",
-                        "amount_vnd": float(amount),
-                        "transaction_id": transaction_id,
-                        "balance_before": float(old_balance),
-                        "balance_after": float(new_balance)
-                    },
-                    "bank"
-                )
-
-            print(
-                "[TOPUP] SUCCESS | "
-                f"User={username} | "
-                f"Amount={amount} | "
-                f"Balance="
-                f"{old_balance} -> "
-                f"{new_balance}"
-            )
-
-
+            description = parse_description(item)
+            code = bank_transfer_code(description)
+            # A fallback hash is retained for review, never for automatic credit.
+            stable_id = first_value(item, ['transactionId','transId','tranId','reference','referenceNo',
+                'referenceId','refNo','transactionCode','trace','traceId','tid','ftid','id'])
+            matches = []
+            if code:
+                if code.isdigit():
+                    matches = [code] if code in users else []
+                else:
+                    matches = [uid for uid, user in users.items() if str(user.get('username','')).casefold() == code.casefold()]
+            reason = ('restore_paused' if STORE.payments_paused() else 'no_stable_id' if stable_id is None or not str(stable_id).strip() else
+                      'no_code' if not code else 'user_not_found' if not matches else
+                      'ambiguous_user' if len(matches) != 1 else 'legacy_username' if not code.isdigit() else 'matched')
+            async with SHOP_TRANSACTION_LOCK:
+                old = STORE.bank_payment(transaction_id)
+                if old is not None:
+                    continue  # Pending payments require explicit admin reconciliation.
+                STORE.observe_bank_payment(transaction_id, amount, description, reason)
+                if reason != 'matched':
+                    pending += 1
+                    continue
+                new_balance = credit_bank_payment(transaction_id, matches[0])
+            credited += 1
             try:
-
-                discord_user = await bot.fetch_user(
-                    int(user_id)
-                )
-
-                dm_lang = get_user_language(user_id)
-
-                await discord_user.send(
-                    pick(
-                        dm_lang,
-                        "💰 **Nạp tiền thành công**\n"
-                        "━━━━━━━━━━━━━━━━━━\n"
-                        f"💵 Số tiền: **{amount:,.0f} VND**\n"
-                        f"💳 Số dư mới: **{new_balance:,.0f} VND**\n"
-                        f"🧾 Giao dịch: `{transaction_id}`\n"
-                        "━━━━━━━━━━━━━━━━━━",
-                        "💰 **Top Up Successful**\n"
-                        "━━━━━━━━━━━━━━━━━━\n"
-                        f"💵 Amount: **{balance_money(amount, 'en')}**\n"
-                        f"💳 New Balance: **{balance_money(new_balance, 'en')}**\n"
-                        f"🧾 Transaction: `{transaction_id}`\n"
-                        "━━━━━━━━━━━━━━━━━━"
-                    )
-                )
-
-            except Exception as e:
-
-                print(
-                    "[TOPUP] DM error: "
-                    f"{e}"
-                )
-
-
-        except Exception as e:
-
-            print(
-                "[TOPUP] Transaction error: "
-                f"{e}"
-            )
+                recipient = await bot.fetch_user(int(matches[0]))
+                await recipient.send(f"💰 +{amount:,} VND • Số dư / Balance: {new_balance:,} VND")
+            except Exception:
+                pass  # Credit is committed; never retry credit because notification failed.
+        except (ValueError, TypeError, KeyError):
+            logging.warning('[BANK] Invalid transaction requires review; no amount was credited')
+        except Exception as exc:
+            logging.error('[BANK] Processing failed (%s)', type(exc).__name__)
+            await service_result('bank-processing', False, type(exc).__name__)
+    if credited or pending:
+        logging.info('[BANK] credited=%s new_pending=%s', credited, pending)
+    if pending:
+        await notify_admins(f"Có {pending} giao dịch ngân hàng mới cần đối soát. Dùng /pendingtopups.")
 
 
 # =========================================================
@@ -2229,7 +2036,7 @@ def create_payfjord_invoice(
 
     except Exception as e:
 
-        return None, str(e)
+        return None, type(e).__name__
 
 
 def get_payfjord_status(trans_id):
@@ -2266,7 +2073,7 @@ def get_payfjord_status(trans_id):
 
     except Exception as e:
 
-        return None, str(e)
+        return None, type(e).__name__
 
 
 # =========================================================
@@ -2275,13 +2082,13 @@ def get_payfjord_status(trans_id):
 
 async def process_crypto_orders():
 
+    if STORE.payments_paused():
+        return
     if not crypto_orders:
         return
 
-    for order_id, order in list(
-        crypto_orders.items()
-    ):
-
+    for order_id in list(crypto_orders):
+        order = crypto_orders[order_id]
         try:
 
             if order.get(
@@ -2317,9 +2124,13 @@ async def process_crypto_orders():
                     f"{order_id}: {error}"
                 )
 
+                await service_result('crypto', False, 'status_request_failed')
                 continue
 
-
+            await service_result('crypto', True)
+            order = crypto_orders.get(order_id)
+            if not order or order.get('credited') or str(order.get('trans_id')) != str(trans_id):
+                continue
             data = status_data
 
             if isinstance(
@@ -2402,13 +2213,7 @@ async def process_crypto_orders():
                 continue
 
 
-            credit_vnd = (
-                received_usd
-                *
-                USD_TO_VND
-            ).quantize(
-                Decimal("1")
-            )
+            credit_vnd = crypto_to_vnd(received_usd, USD_TO_VND)
 
 
             user_id = str(
@@ -2421,7 +2226,9 @@ async def process_crypto_orders():
 
 
             with data_transaction():
-                old_balance = parse_number(
+                if not STORE.claim_crypto_payment(trans_id):
+                    continue
+                old_balance = vnd(
                     users[user_id].get(
                         "balance",
                         0
@@ -2436,19 +2243,13 @@ async def process_crypto_orders():
                 )
 
 
-                users[user_id]["balance"] = float(
-                    new_balance
-                )
+                users[user_id]["balance"] = vnd(new_balance)
 
 
                 order["credited"] = True
                 order["status"] = "completed"
-                order["received_usd"] = float(
-                    received_usd
-                )
-                order["credit_vnd"] = float(
-                    credit_vnd
-                )
+                order["received_usd"] = str(received_usd)
+                order["credit_vnd"] = vnd(credit_vnd)
                 order["completed_at"] = (
                     datetime.now().isoformat()
                 )
@@ -2480,12 +2281,12 @@ async def process_crypto_orders():
                     "topup_completed",
                     {
                         "method": "Crypto",
-                        "amount_usd": float(received_usd),
-                        "amount_vnd": float(credit_vnd),
+                        "amount_usd": str(received_usd),
+                        "amount_vnd": vnd(credit_vnd),
                         "transaction_id": str(trans_id),
                         "order_id": order_id,
-                        "balance_before": float(old_balance),
-                        "balance_after": float(new_balance)
+                        "balance_before": vnd(old_balance),
+                        "balance_after": vnd(new_balance)
                     },
                     "crypto"
                 )
@@ -2564,7 +2365,103 @@ bot = commands.Bot(
 tree = bot.tree
 
 
+# =========================================================
+# RUNTIME POLICY, HEALTH AND BACKUPS
+# =========================================================
+
+def can_manage(interaction):
+    return POLICY.can_manage(interaction)
+
+
+def admin_check():
+    async def predicate(interaction):
+        if not can_manage(interaction):
+            raise app_commands.CheckFailure('Server or administrator is not authorized in operations.json')
+        return True
+    return app_commands.check(predicate)
+
+
+async def ensure_allowed_interaction(interaction):
+    guild = getattr(interaction, 'guild', None)
+    if guild is None or POLICY.allowed_guild(guild.id):
+        return True
+    if not interaction.response.is_done():
+        await interaction.response.send_message('❌ Bot không được cấu hình để hoạt động trong server này.', ephemeral=True)
+    return False
+
+
+async def notify_admins(message):
+    channel_id = POLICY.config['alert_channel_id']
+    if channel_id:
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            if POLICY.allowed_guild(channel.guild.id):
+                await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
+                return
+        except Exception:
+            pass
+    for user_id in POLICY.config['admin_user_ids']:
+        try:
+            recipient = await bot.fetch_user(user_id)
+            await recipient.send(message, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            logging.warning('[ALERT] Could not notify configured administrator')
+
+
+async def service_result(service, ok, detail=''):
+    path = os.path.join(DATA_DIR, 'service_health.json')
+    health = load_json(path, {})
+    previous = health.get(service, {})
+    failures = 0 if ok else int(previous.get('failures', 0)) + 1
+    now = time.time()
+    threshold = POLICY.config['bank_failure_threshold'] if service.startswith('bank') else 1
+    alert = not ok and failures >= threshold and now - previous.get('last_alert', 0) >= POLICY.config['alert_repeat_seconds']
+    recovered = ok and previous.get('alerted', False)
+    health[service] = {
+        'ok': ok, 'failures': failures, 'checked_at': now,
+        'detail': detail, 'last_alert': now if alert else previous.get('last_alert', 0),
+        'alerted': (previous.get('alerted', False) or alert) if not ok else False,
+    }
+    save_json(path, health)
+    if alert:
+        logging.error('[HEALTH] %s failed %s times (%s)', service, failures, detail)
+        await notify_admins(f"⚠️ {service}: lỗi liên tiếp {failures} lần ({detail}). Kiểm tra /botstatus và nhật ký VPS.")
+    elif recovered:
+        logging.info('[HEALTH] %s recovered', service)
+        await notify_admins(f"✅ {service} đã hoạt động trở lại.")
+
+
+async def bootstrap_policy():
+    if POLICY.config['allowed_guild_ids'] or not POLICY.config['bootstrap_from_stock_channel']:
+        return
+    try:
+        channel = bot.get_channel(STOCK_CHANNEL_ID) or await bot.fetch_channel(STOCK_CHANNEL_ID)
+        POLICY.config['allowed_guild_ids'] = [int(channel.guild.id)]
+        POLICY.config['bootstrap_from_stock_channel'] = False
+        POLICY.save()
+        logging.info('[POLICY] Bound to the guild of the existing configured stock channel')
+    except Exception:
+        logging.error('[POLICY] Server not configured. Stop bot and run manage_bot.py configure --guild-id ID --admin-id ID')
+
+
+@tasks.loop(minutes=1)
+async def maintenance_loop():
+    # A stalled asyncio loop stops this heartbeat; the Windows supervisor restarts it.
+    Path(BASE_DIR, 'data', 'heartbeat').touch()
+    last = load_json(os.path.join(DATA_DIR, 'backup_status.json'), {})
+    if time.time() - last.get('completed_at', 0) < POLICY.config['backup_interval_hours'] * 3600:
+        return
+    try:
+        target = await asyncio.to_thread(rotating_backup, BASE_DIR, POLICY.config['backup_keep'])
+        save_json(os.path.join(DATA_DIR, 'backup_status.json'), {'completed_at': time.time(), 'file': target.name})
+        await service_result('backup', True)
+    except Exception as exc:
+        await service_result('backup', False, type(exc).__name__)
+
+
 async def _tree_interaction_check(interaction):
+    if not await ensure_allowed_interaction(interaction):
+        return False
     apply_locale_default(interaction)
     return True
 
@@ -3036,6 +2933,8 @@ class ShopPanelView(View):
     """
 
     async def interaction_check(self, interaction: discord.Interaction):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         apply_locale_default(interaction)
         return True
 
@@ -3070,6 +2969,8 @@ class ShopPanelView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         ensure_user(interaction.user)
         await open_buy_flow(interaction)
 
@@ -3085,6 +2986,8 @@ class ShopPanelView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         user = ensure_user(interaction.user)
         balance = parse_number(
             user.get("balance", 0)
@@ -3146,6 +3049,8 @@ class ShopPanelView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         ensure_user(interaction.user)
         await interaction.response.send_modal(
             TopupModal(get_user_language(interaction.user.id))
@@ -3163,6 +3068,8 @@ class ShopPanelView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         ensure_user(interaction.user)
         await interaction.response.send_modal(
             CryptoModal(get_user_language(interaction.user.id))
@@ -3180,6 +3087,8 @@ class ShopPanelView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         lang = get_user_language(interaction.user.id)
         await interaction.response.send_message(
             embed=build_stock_embed(lang),
@@ -3200,6 +3109,8 @@ class ShopPanelView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         recent = get_user_orders(interaction.user.id, 10)
         topups = get_user_topups(interaction.user.id, 10)
         lang = get_user_language(interaction.user.id)
@@ -3271,6 +3182,8 @@ class ShopPanelView(View):
         # Do not use self.language here because this persistent view is shared
         # by the public stock message and can be created with the default VI
         # language after a bot restart.
+        if not await ensure_allowed_interaction(interaction):
+            return False
         ensure_user(interaction.user)
         current = get_user_language(interaction.user.id)
         new_language = "en" if current != "en" else "vi"
@@ -3332,6 +3245,8 @@ def save_order(order_id, order):
     orders = load_orders()
     orders[order_id] = order
     save_json(ORDERS_FILE, orders)
+    if order.get('delivery_status') == 'pending':
+        STORE.enqueue_delivery(order_id, order['user_id'])
 
     # Also save an archive document in SQLite so the order
     # can be checked easily for warranty purposes. This document contains
@@ -3358,6 +3273,8 @@ def cleanup_expired_orders():
     orders = load_orders()
     with data_transaction():
         for order_id, order in list(orders.items()):
+            if STORE.delivery_pending(order_id):
+                continue
             raw = order.get("created_at") if isinstance(order, dict) else None
             if not raw:
                 continue
@@ -3373,7 +3290,7 @@ def cleanup_expired_orders():
         # Remove old orphaned database archives as well.
         rows = STORE.db.execute("SELECT path, payload FROM documents WHERE path LIKE 'data/orders/%.json'").fetchall()
         for path, payload in rows:
-            if os.path.basename(path)[:-5] in orders:
+            if os.path.basename(path)[:-5] in orders or STORE.delivery_pending(os.path.basename(path)[:-5]):
                 continue
             item = json.loads(payload)
             try:
@@ -3710,6 +3627,8 @@ async def update_stock_panel(channel_id, panels):
             print(f"[STOCK] Channel error ({channel_id}): {e}")
             return "error"
 
+    if not POLICY.allowed_guild(getattr(getattr(channel, 'guild', None), 'id', None)):
+        return 'forbidden'
     message_id = saved.get("message_id")
     banner_ready = bool(saved.get("banner"))
 
@@ -3859,6 +3778,8 @@ class BuyModal(Modal):
         interaction: discord.Interaction
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         lang = get_user_language(interaction.user.id)
 
         try:
@@ -4120,6 +4041,8 @@ class ProductSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         product = get_product_by_id(self.values[0])
 
         if product is None:
@@ -4160,6 +4083,8 @@ class ProductDetailView(View):
         )
 
     async def interaction_check(self, interaction: discord.Interaction):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         return interaction.user.id == self.user_id
 
     @discord.ui.button(
@@ -4174,6 +4099,8 @@ class ProductDetailView(View):
         button: Button
     ):
         # Re-read the product so price/stock are fresh.
+        if not await ensure_allowed_interaction(interaction):
+            return False
         product = get_product_by_id(self.product["id"])
 
         if product is None:
@@ -4202,6 +4129,8 @@ class ProductDetailView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         await interaction.response.edit_message(
             embed=build_choose_product_embed(self.language),
             view=ProductSelectView(
@@ -4221,12 +4150,17 @@ class ProductSelectView(View):
             self.add_item(ProductSelect(language, products))
 
     async def interaction_check(self, interaction: discord.Interaction):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         return interaction.user.id == self.user_id
 
 
 async def open_buy_flow(interaction: discord.Interaction):
     """Buy button and /buy: straight to the quantity form, or pick a product first."""
 
+    if STORE.payments_paused():
+        await interaction.response.send_message('🛠️ Shop đang đối chiếu dữ liệu sau khôi phục. Vui lòng quay lại sau.', ephemeral=True)
+        return
     lang = get_user_language(interaction.user.id)
     products = get_all_products()
 
@@ -4524,6 +4458,8 @@ class ConfirmBuyView(View):
         button: Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         lang = get_user_language(interaction.user.id)
 
         if interaction.user.id != self.user_id:
@@ -4541,6 +4477,10 @@ class ConfirmBuyView(View):
         async with SHOP_TRANSACTION_LOCK:
             if self.completed:
                 await interaction.followup.send("Đơn hàng này đã được xử lý / Already processed.", ephemeral=True)
+                return
+
+            if STORE.payments_paused():
+                await interaction.followup.send('🛠️ Shop đang đối chiếu dữ liệu sau khôi phục. Bạn chưa bị trừ tiền.', ephemeral=True)
                 return
 
             # The product may have been removed after this order was opened.
@@ -4655,6 +4595,7 @@ class ConfirmBuyView(View):
                         "unit_price": self.price,
                         "total": int(total),
                         "status": "completed",
+                        "delivery_status": "pending",
                         "created_at": order_created_at.isoformat(),
                         "accounts": purchased
                     }
@@ -4677,12 +4618,6 @@ class ConfirmBuyView(View):
         self.completed = True
         self.stop()
 
-        content = "\n".join(purchased)
-        file = discord.File(
-            io.BytesIO(content.encode("utf-8")),
-            filename=f"{order_id}.txt"
-        )
-
         warranty_days_text = pick(
             lang,
             f"{warranty_days} ngày",
@@ -4701,9 +4636,9 @@ class ConfirmBuyView(View):
             pick(
                 lang,
                 "Đơn hàng của bạn đã hoàn tất.\n\n"
-                "📦 Danh sách account đã được gửi vào DM của bạn.",
+                "📦 Bot đang gửi account vào DM. Nếu chưa nhận được, dùng `/redeliver` hoặc `/downloadorder`.",
                 "Your order has been completed successfully.\n\n"
-                "📦 The account list has been sent to your DM."
+                "📦 Delivery is being sent to your DMs. Use `/redeliver` or `/downloadorder` if needed."
             ),
             UI_GREEN
         )
@@ -4760,89 +4695,9 @@ class ConfirmBuyView(View):
         except Exception:
             pass
 
-        try:
-            delivery_embed = make_embed(
-                pick(lang, "📦 Giao hàng account", "📦 Your Account Delivery"),
-                pick(
-                    lang,
-                    f"Mã đơn hàng: `{order_id}`\n\n"
-                    "Danh sách account đã mua được đính kèm bên dưới.\n"
-                    "Vui lòng lưu giữ file này cẩn thận.",
-                    f"Order ID: `{order_id}`\n\n"
-                    "Your purchased accounts are attached below.\n"
-                    "Please keep this file safe."
-                ),
-                UI_GREEN
-            )
-
-            delivery_embed.add_field(
-                name=pick(lang, "🛍️ Sản phẩm", "🛍️ Product"),
-                value=f"**{self.product['name']}**",
-                inline=False
-            )
-
-            delivery_embed.add_field(
-                name=warranty_field_name,
-                value=warranty_field_value,
-                inline=False
-            )
-
-            files_to_send = [file]
-
-            # "Purchase Successful" image is shown INSIDE the same embed so the
-            # customer receives one single DM. If the image cannot be built,
-            # the delivery is still sent without it.
-            try:
-                loop = asyncio.get_running_loop()
-                image_buffer = await loop.run_in_executor(
-                    None,
-                    build_purchase_success_image,
-                    order_id,
-                    self.quantity,
-                    total,
-                    warranty_until,
-                    lang
-                )
-
-                if image_buffer is not None:
-                    delivery_embed.set_image(
-                        url="attachment://purchase_successful.png"
-                    )
-                    files_to_send.append(
-                        discord.File(
-                            image_buffer,
-                            filename="purchase_successful.png"
-                        )
-                    )
-
-            except Exception as image_error:
-                print(
-                    f"[BUY] Success image error: {image_error}"
-                )
-
-            await interaction.user.send(
-                embed=delivery_embed,
-                files=files_to_send
-            )
-
-        except Exception as e:
-            print(
-                f"[BUY] DM error: {e}"
-            )
-
-            try:
-                await interaction.followup.send(
-                    pick(
-                        lang,
-                        "⚠️ Mua hàng thành công nhưng mình không thể gửi DM giao hàng. "
-                        "Vui lòng bật nhận tin nhắn riêng từ thành viên trong server.",
-                        "⚠️ Purchase completed, but I could not send the delivery DM. "
-                        "Please enable DMs from server members."
-                    ),
-                    ephemeral=True
-                )
-            except Exception:
-                pass
+        delivered, delivery_message = await deliver_order(order_id)
+        if not delivered:
+            await interaction.followup.send(delivery_message, ephemeral=True)
 
         await update_stock_message()
 
@@ -4857,6 +4712,8 @@ class ConfirmBuyView(View):
         button: Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         lang = get_user_language(interaction.user.id)
 
         if interaction.user.id != self.user_id:
@@ -4927,6 +4784,8 @@ class TopupModal(Modal):
         interaction: discord.Interaction
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         lang = get_user_language(interaction.user.id)
 
         ensure_user(
@@ -5129,6 +4988,8 @@ class CryptoModal(Modal):
         interaction: discord.Interaction
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         lang = get_user_language(interaction.user.id)
 
         try:
@@ -5263,9 +5124,7 @@ class CryptoModal(Modal):
         crypto_orders[order_id] = {
             "user_id": interaction.user.id,
             "username": interaction.user.name,
-            "amount_usd": float(
-                amount_usd
-            ),
+            "amount_usd": str(amount_usd),
             "request_id": request_id,
             "trans_id": str(
                 trans_id
@@ -5344,6 +5203,219 @@ class CryptoModal(Modal):
 
 
 # =========================================================
+# DELIVERY OUTBOX AND RECONCILIATION
+# =========================================================
+
+DELIVERY_LOCKS = {}
+
+
+def update_delivery_order(order_id, status):
+    order = load_orders().get(order_id)
+    if order:
+        order['delivery_status'] = status
+        save_order(order_id, order)
+
+
+async def deliver_order(order_id, manual=False):
+    lock = DELIVERY_LOCKS.setdefault(order_id, asyncio.Lock())
+    async with lock:
+        order = load_orders().get(order_id)
+        if not order or not order.get('accounts'):
+            return False, 'Không tìm thấy nội dung đơn hàng / Order contents unavailable.'
+        row = STORE.delivery(order_id)
+        now = time.time()
+        if row and row['next_attempt_at'] > now:
+            return row['status'] == 'sent', 'Vui lòng chờ ít nhất 60 giây trước khi gửi lại / Please wait before retrying.'
+        if row and row['status'] == 'sent' and not manual:
+            return True, 'Đơn đã giao / Already delivered.'
+        if row and row['attempts'] >= 5 and not manual:
+            return False, 'Đã dừng tự gửi sau 5 lần lỗi. Dùng /redeliver hoặc /downloadorder.'
+        with data_transaction():
+            STORE.enqueue_delivery(order_id, order['user_id'])
+            STORE.db.execute("UPDATE deliveries SET status='sending',attempts=attempts+1,next_attempt_at=? WHERE order_id=?",
+                             (now + 300, order_id))
+        try:
+            recipient = await bot.fetch_user(int(order['user_id']))
+            lang = get_user_language(order['user_id'])
+            embed = make_embed(pick(lang, '📦 Giao hàng account', '📦 Your Account Delivery'),
+                f"{order_id}\n{discord.utils.escape_markdown(str(order.get('product', '')))}\n{warranty_status_text(order, lang)}", UI_GREEN)
+            content = '\n'.join(order['accounts']).encode('utf-8')
+            attachment = discord.File(io.BytesIO(content), filename=f'{order_id}.txt')
+            files = [attachment]
+            try:
+                days = get_order_warranty_days(order)
+                until = datetime.fromisoformat(order['created_at']) + timedelta(days=days) if days else None
+                image = await asyncio.to_thread(build_purchase_success_image, order_id,
+                    order.get('quantity', len(order['accounts'])), order.get('total', 0), until, lang)
+                if image is not None:
+                    files.append(discord.File(image, filename='purchase_successful.png'))
+                    embed.set_image(url='attachment://purchase_successful.png')
+            except Exception:
+                pass  # Rendering must never prevent account delivery.
+            message = await recipient.send(embed=embed, files=files, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            # Exceptions may contain URLs/credentials; persist and log only the class.
+            error = type(exc).__name__
+            row = STORE.delivery(order_id)
+            with data_transaction():
+                STORE.db.execute("UPDATE deliveries SET status='failed',last_error=?,next_attempt_at=? WHERE order_id=?",
+                                 (error, time.time() + min(3600, 60 * 2 ** min(row['attempts'], 5)), order_id))
+                update_delivery_order(order_id, 'failed')
+            if row['attempts'] in (1, 5):
+                await notify_admins(f'⚠️ Đơn {order_id} chưa giao được ({error}). Khách có thể dùng /downloadorder hoặc /redeliver.')
+            return False, 'Chưa gửi được DM. Bật nhận DM rồi dùng /redeliver, hoặc dùng /downloadorder để tải riêng tư.'
+        with data_transaction():
+            STORE.db.execute("UPDATE deliveries SET status='sent',last_error=NULL,message_id=?,next_attempt_at=? WHERE order_id=?",
+                             (str(getattr(message, 'id', '')), time.time() + 60, order_id))
+            update_delivery_order(order_id, 'sent')
+        return True, '✅ Đã gửi đơn vào DM / Order sent to your DMs.'
+
+
+@tasks.loop(minutes=1)
+async def delivery_retry_loop():
+    if STORE.payments_paused():
+        return
+    for order_id in STORE.due_deliveries(time.time()):
+        try:
+            await deliver_order(order_id)
+        except Exception as exc:
+            logging.error('[DELIVERY] Retry failed (%s)', type(exc).__name__)
+
+
+@tree.command(name='redeliver', description='Send an existing order to its buyer again; no extra charge')
+@app_commands.describe(order_id='Order ID')
+async def redeliver(interaction: discord.Interaction, order_id: str):
+    order_id = order_id.strip().upper()
+    order = load_orders().get(order_id)
+    if not order or (str(order.get('user_id')) != str(interaction.user.id) and not can_manage(interaction)):
+        await interaction.response.send_message('❌ Không tìm thấy đơn của bạn hoặc bạn không có quyền.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    _, message = await deliver_order(order_id, manual=True)
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@tree.command(name='downloadorder', description='Download your purchased accounts privately when DMs are unavailable')
+@app_commands.describe(order_id='Your order ID')
+async def downloadorder(interaction: discord.Interaction, order_id: str):
+    order_id = order_id.strip().upper()
+    order = load_orders().get(order_id)
+    # Even administrators must not download another customer's credentials here.
+    if not order or str(order.get('user_id')) != str(interaction.user.id) or not order.get('accounts'):
+        await interaction.response.send_message('❌ Không tìm thấy nội dung đơn hàng của bạn.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    lock = DELIVERY_LOCKS.setdefault(order_id, asyncio.Lock())
+    async with lock:
+        attachment = discord.File(io.BytesIO('\n'.join(order['accounts']).encode('utf-8')), filename=f'{order_id}.txt')
+        await interaction.followup.send('📦 Nội dung đơn hàng của bạn / Your order:', file=attachment, ephemeral=True)
+        with data_transaction():
+            STORE.enqueue_delivery(order_id, order['user_id'])
+            STORE.db.execute("UPDATE deliveries SET status='sent',last_error=NULL,next_attempt_at=? WHERE order_id=?", (time.time() + 60, order_id))
+            update_delivery_order(order_id, 'sent')
+
+
+@tree.command(name='pendingtopups', description='Admin: list bank transfers requiring reconciliation')
+@app_commands.guild_only()
+@admin_check()
+async def pendingtopups(interaction: discord.Interaction):
+    rows = STORE.pending_bank_payments(10)
+    embed = make_embed('💳 Giao dịch cần đối soát', '10 giao dịch cũ nhất. Dùng /reconciletopup hoặc /ignoretopup.', UI_GOLD)
+    if not rows:
+        embed.description = 'Không có giao dịch đang chờ đối soát.'
+    for row in rows:
+        embed.add_field(name=str(row['transaction_id'])[:256],
+            value=f"{row['amount_vnd']:,} VND • {row['reason']}\n{discord.utils.escape_markdown(row['description'][:400])}", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name='reconciletopup', description='Admin: credit one observed pending bank transfer to the verified buyer')
+@app_commands.guild_only()
+@admin_check()
+@app_commands.describe(transaction_id='Exact ID from /pendingtopups', user='Verified recipient of this transfer', reason='Reason and evidence used for reconciliation')
+async def reconciletopup(interaction: discord.Interaction, transaction_id: str, user: discord.Member, reason: str):
+    transaction_id = transaction_id.strip()
+    if not reason.strip() or len(reason) > 200:
+        await interaction.response.send_message('❌ Nhập lý do đối soát từ 1 đến 200 ký tự.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        async with SHOP_TRANSACTION_LOCK:
+            row = STORE.bank_payment(transaction_id)
+            if not row or row['status'] != 'pending' or is_transaction_processed(transaction_id):
+                raise ValueError('not_pending')
+            ensure_user(user)
+            new_balance = credit_bank_payment(transaction_id, user.id, interaction.user.id, reason.strip())
+    except ValueError:
+        await interaction.followup.send('❌ Giao dịch không tồn tại, đã xử lý hoặc dữ liệu cần kiểm tra. Không cộng tiền.', ephemeral=True)
+        return
+    await interaction.followup.send(f"✅ Đã cộng {row['amount_vnd']:,} VND cho ID {user.id}. Số dư: {new_balance:,} VND.", ephemeral=True)
+    try:
+        await user.send(f"💰 Đối soát nạp tiền: +{row['amount_vnd']:,} VND. Số dư: {new_balance:,} VND.")
+    except Exception:
+        pass
+
+
+@tree.command(name='ignoretopup', description='Admin: dismiss an observed transfer without crediting a balance')
+@app_commands.guild_only()
+@admin_check()
+async def ignoretopup(interaction: discord.Interaction, transaction_id: str, reason: str):
+    transaction_id = transaction_id.strip()
+    if not reason.strip() or len(reason) > 200:
+        await interaction.response.send_message('❌ Nhập lý do từ 1 đến 200 ký tự.', ephemeral=True)
+        return
+    try:
+        async with SHOP_TRANSACTION_LOCK:
+            with data_transaction():
+                row = STORE.bank_payment(transaction_id)
+                if not row or row['status'] != 'pending' or not mark_transaction_processed(transaction_id):
+                    raise ValueError('not_pending')
+                STORE.settle_bank_payment(transaction_id, 'ignored', None, interaction.user.id)
+                log_activity(interaction.user.id, interaction.user.name, 'bank_transfer_ignored',
+                             {'transaction_id': transaction_id, 'reason': reason.strip()}, 'command')
+    except ValueError:
+        await interaction.response.send_message('❌ Không tìm thấy giao dịch đang chờ. Không có thay đổi.', ephemeral=True)
+        return
+    await interaction.response.send_message('✅ Đã bỏ qua giao dịch; không cộng tiền.', ephemeral=True)
+
+
+@tree.command(name='backup', description='Admin: create and verify a local SQLite backup')
+@app_commands.guild_only()
+@admin_check()
+async def backup_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target = await asyncio.to_thread(rotating_backup, BASE_DIR, POLICY.config['backup_keep'])
+        save_json(os.path.join(DATA_DIR, 'backup_status.json'), {'completed_at': time.time(), 'file': target.name})
+        await service_result('backup', True)
+    except Exception as exc:
+        await service_result('backup', False, type(exc).__name__)
+        await interaction.followup.send('❌ Sao lưu thất bại. Kiểm tra dung lượng/quyền ghi trên VPS.', ephemeral=True)
+        return
+    await interaction.followup.send(f'✅ Đã sao lưu và kiểm tra toàn vẹn: backups/sqlite/{target.name}', ephemeral=True)
+
+
+@tree.command(name='botstatus', description='Admin: inspect database, backup, bank and delivery status')
+@app_commands.guild_only()
+@admin_check()
+async def botstatus(interaction: discord.Interaction):
+    health = load_json(os.path.join(DATA_DIR, 'service_health.json'), {})
+    backup = load_json(os.path.join(DATA_DIR, 'backup_status.json'), {})
+    pending = STORE.db.execute("SELECT count(*) FROM bank_payments WHERE status='pending'").fetchone()[0]
+    undelivered = STORE.db.execute("SELECT count(*) FROM deliveries WHERE status!='sent'").fetchone()[0]
+    integrity = STORE.db.execute('PRAGMA quick_check').fetchone()[0]
+    message = (f"SQLite: {integrity}\nNgân hàng: {'OK' if health.get('bank', {}).get('ok') else 'chưa xác nhận / lỗi'}\n"
+               f"Nạp cần đối soát: {pending}\nĐơn chưa giao: {undelivered}\n"
+               f"Backup gần nhất: {backup.get('file', 'chưa có')}\nServer được phép: {len(POLICY.config['allowed_guild_ids'])}\n"
+               f"Tạm dừng nạp sau restore: {STORE.payments_paused()}")
+    for name in ('bank-processing', 'crypto', 'backup'):
+        record = health.get(name)
+        if record:
+            message += f"\n{name}: {'OK' if record.get('ok') else 'LỖI'}"
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+# =========================================================
 # /HELP
 # =========================================================
 
@@ -5368,7 +5440,9 @@ def build_help_embed(language="vi"):
                 "`/topupcrypto` — Open the crypto top-up form.\n"
                 "`/history` — View your top-up and order history.\n"
                 "`/order <order_id>` — View details of your order.\n"
-                "`/checkwarranty <order_id>` — Check the warranty status of your own order."
+                "`/checkwarranty <order_id>` — Check the warranty status of your own order.\n"
+                "`/redeliver <order_id>` — Retry delivery without another charge.\n"
+                "`/downloadorder <order_id>` — Download your accounts privately."
             ),
             inline=False
         )
@@ -5382,11 +5456,13 @@ def build_help_embed(language="vi"):
                 "`/removebalance <user> <amount>` — Remove VND balance from a user.\n"
                 "`/warranty <order_id>` — Check warranty details for an order as an administrator.\n"
                 "`/checkusername <username>` — View the recorded activity history of a username.\n"
-                "`/setstockmessage [channel_id]` — Create or refresh the public shop panel in a channel (any server the bot is in).\n`/removestockmessage <channel_id>` — Stop and delete the shop panel of a channel."
+                "`/setstockmessage [channel_id]` — Create or refresh the public shop panel in a channel (authorized servers only).\n`/removestockmessage <channel_id>` — Stop and delete the shop panel of a channel."
             ),
             inline=False
         )
 
+        embed.add_field(name="🛠️ Operations (authorized admins)",
+            value="`/pendingtopups` • `/reconciletopup` • `/ignoretopup`\n`/backup` • `/botstatus`", inline=False)
         embed.add_field(
             name="💡 Quick Guide",
             value=(
@@ -5435,11 +5511,13 @@ def build_help_embed(language="vi"):
                 "`/removebalance <user> <amount>` — Trừ số dư VND của người dùng.\n"
                 "`/warranty <order_id>` — Kiểm tra chi tiết bảo hành đơn hàng với quyền Admin.\n"
                 "`/checkusername <username>` — Xem lịch sử hoạt động đã được ghi nhận của username.\n"
-                "`/setstockmessage [channel_id]` — Tạo hoặc cập nhật panel cửa hàng công khai trong một kênh (bất kỳ server nào có bot).\n`/removestockmessage <channel_id>` — Gỡ và xóa panel cửa hàng của một kênh."
+                "`/setstockmessage [channel_id]` — Tạo hoặc cập nhật panel cửa hàng công khai trong một kênh (server đã cấp quyền).\n`/removestockmessage <channel_id>` — Gỡ và xóa panel cửa hàng của một kênh."
             ),
             inline=False
         )
 
+        embed.add_field(name="🛠️ Vận hành (quản trị được cấp quyền)",
+            value="`/pendingtopups` • `/reconciletopup` • `/ignoretopup`\n`/backup` • `/botstatus`\n`/redeliver` • `/downloadorder`: giao lại hoặc tải đơn đã mua.", inline=False)
         embed.add_field(
             name="💡 Hướng dẫn nhanh",
             value=(
@@ -5475,6 +5553,8 @@ class HelpPanelView(View):
         self.add_item(language_button)
 
     async def language_button_callback(self, interaction: discord.Interaction):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         ensure_user(interaction.user)
 
         current = get_user_language(interaction.user.id)
@@ -5701,6 +5781,8 @@ class BalanceDMView(View):
         interaction: discord.Interaction,
         button: Button
     ):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         message_id = str(interaction.message.id) if interaction.message else ""
         data = load_balance_dm_payloads()
         payload = data.get(message_id)
@@ -5785,9 +5867,9 @@ async def notify_balance_change(
             message.id,
             {
                 "kind": kind,
-                "amount": float(amount),
-                "old_balance": float(old_balance),
-                "new_balance": float(new_balance),
+                "amount": vnd(amount),
+                "old_balance": vnd(old_balance),
+                "new_balance": vnd(new_balance),
                 "reason": reason,
                 "lang": lang,
                 "sent_at": datetime.now().isoformat()
@@ -5824,7 +5906,7 @@ def dm_status_field(embed, dm_sent, lang):
     name="addbalance",
     description="Admin: add balance to a user"
 )
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(
     user="User who will receive the balance",
     amount="Amount in VND",
@@ -5861,7 +5943,7 @@ async def addbalance(
             old_balance = Decimal(str(get_user_balance(user.id)))
             new_balance = old_balance + Decimal(amount)
 
-            target["balance"] = float(new_balance)
+            target["balance"] = vnd(new_balance)
             save_json(
                 USERS_FILE,
                 users
@@ -5875,8 +5957,8 @@ async def addbalance(
                     "target_user_id": user.id,
                     "target_username": user.name,
                     "amount": amount,
-                    "balance_before": float(old_balance),
-                    "balance_after": float(new_balance),
+                    "balance_before": vnd(old_balance),
+                    "balance_after": vnd(new_balance),
                     "reason": reason
                 },
                 "command"
@@ -5948,7 +6030,7 @@ def gap_warning_text(tiers, lang="vi"):
     description="Admin: set a product's price per tier range and/or its warranty days"
 )
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(
     product="Product to change",
     price="New price per account in VND",
@@ -6255,6 +6337,8 @@ async def setprice_product_autocomplete(
     interaction: discord.Interaction,
     current: str
 ):
+    if not can_manage(interaction):
+        return []
     current = current.strip().casefold()
 
     choices = []
@@ -6277,6 +6361,8 @@ async def setprice_tier_autocomplete(
     interaction: discord.Interaction,
     current: str
 ):
+    if not can_manage(interaction):
+        return []
     target = find_product_by_query(
         getattr(interaction.namespace, "product", "")
     )
@@ -6322,7 +6408,7 @@ async def setprice_tier_autocomplete(
     description="Admin: remove a quantity tier from a product"
 )
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(
     product="Product to change",
     tier="Tier to remove (pick one from the list or type its starting number)"
@@ -6449,6 +6535,8 @@ async def removetier_product_autocomplete(
     interaction: discord.Interaction,
     current: str
 ):
+    if not can_manage(interaction):
+        return []
     return await setprice_product_autocomplete(interaction, current)
 
 
@@ -6457,6 +6545,8 @@ async def removetier_tier_autocomplete(
     interaction: discord.Interaction,
     current: str
 ):
+    if not can_manage(interaction):
+        return []
     target = find_product_by_query(
         getattr(interaction.namespace, "product", "")
     )
@@ -6487,7 +6577,7 @@ MAX_STOCK_UPLOAD_LINES = 50_000
 @tree.command(name="addstock", description="Admin: select a product and upload a TXT file to add stock")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(
     product="Choose the product to replenish",
     file="UTF-8 .txt file, one account per line"
@@ -6588,7 +6678,9 @@ async def addstock(interaction: discord.Interaction, product: str, file: discord
 
 @addstock.autocomplete("product")
 async def addstock_product_autocomplete(interaction: discord.Interaction, current: str):
-    if interaction.guild is None or not interaction.permissions.administrator:
+    if not can_manage(interaction):
+        return []
+    if not can_manage(interaction):
         return []
     query = current.strip().casefold()
     return [app_commands.Choice(name=item["name"][:100], value=item["id"])
@@ -6603,7 +6695,7 @@ async def addstock_product_autocomplete(interaction: discord.Interaction, curren
 @tree.command(name="removestock", description="Admin: remove a quantity of accounts from the end of a product's stock")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(product="Choose the product", quantity="Number of accounts to remove from the end of stock")
 async def removestock(interaction: discord.Interaction, product: str, quantity: app_commands.Range[int, 1]):
     lang = get_user_language(interaction.user.id)
@@ -6654,6 +6746,8 @@ async def removestock(interaction: discord.Interaction, product: str, quantity: 
 
 @removestock.autocomplete("product")
 async def removestock_product_autocomplete(interaction: discord.Interaction, current: str):
+    if not can_manage(interaction):
+        return []
     return await addstock_product_autocomplete(interaction, current)
 
 
@@ -6666,7 +6760,7 @@ async def removestock_product_autocomplete(interaction: discord.Interaction, cur
     description="Admin: add a product (or update its price and warranty)"
 )
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(
     name="Product name",
     price="Price per account in VND",
@@ -6844,7 +6938,9 @@ class RemoveProductConfirmView(View):
         self.cancel_button.label = pick(self.language, "Hủy", "Cancel")
 
     async def interaction_check(self, interaction: discord.Interaction):
-        if (interaction.user.id == self.user_id and interaction.permissions.administrator):
+        if not await ensure_allowed_interaction(interaction):
+            return False
+        if (interaction.user.id == self.user_id and can_manage(interaction)):
             return True
         await interaction.response.send_message(
             pick(self.language, "Bạn không có quyền xác nhận thao tác này.", "You cannot confirm this action."),
@@ -6853,6 +6949,8 @@ class RemoveProductConfirmView(View):
 
     @discord.ui.button(label="Confirm removal", emoji="🗑️", style=discord.ButtonStyle.danger, row=0)
     async def confirm_button(self, interaction: discord.Interaction, button: Button):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         if not await self.interaction_check(interaction):
             return
         lang = self.language
@@ -6908,6 +7006,8 @@ class RemoveProductConfirmView(View):
 
     @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.secondary, row=0)
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        if not await ensure_allowed_interaction(interaction):
+            return False
         if not await self.interaction_check(interaction):
             return
         async with SHOP_TRANSACTION_LOCK:
@@ -6930,7 +7030,7 @@ class RemoveProductConfirmView(View):
     description="Admin: remove a product, including the original default product"
 )
 @app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(
     product="Product to remove"
 )
@@ -6999,6 +7099,8 @@ async def removeproduct_autocomplete(
     interaction: discord.Interaction,
     current: str
 ):
+    if not can_manage(interaction):
+        return []
     current = current.strip().casefold()
 
     choices = []
@@ -7023,7 +7125,7 @@ async def removeproduct_autocomplete(
     name="removebalance",
     description="Admin: remove balance from a user"
 )
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(
     user="User whose balance will be removed",
     amount="Amount in VND",
@@ -7075,7 +7177,7 @@ async def removebalance(
 
         with data_transaction():
             new_balance = old_balance - Decimal(amount)
-            target["balance"] = float(new_balance)
+            target["balance"] = vnd(new_balance)
 
             save_json(
                 USERS_FILE,
@@ -7090,8 +7192,8 @@ async def removebalance(
                     "target_user_id": user.id,
                     "target_username": user.name,
                     "amount": amount,
-                    "balance_before": float(old_balance),
-                    "balance_after": float(new_balance),
+                    "balance_before": vnd(old_balance),
+                    "balance_after": vnd(new_balance),
                     "reason": reason
                 },
                 "command"
@@ -7382,7 +7484,7 @@ async def order(interaction: discord.Interaction, order_id: str):
 # =========================================================
 
 @tree.command(name="warranty", description="Admin: check warranty information by Order ID")
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(order_id="Enter the Order ID, e.g. LC-20260923-A1B2C3")
 async def warranty(interaction: discord.Interaction, order_id: str):
     order_id = order_id.strip().upper()
@@ -7589,7 +7691,7 @@ async def checkwarranty(interaction: discord.Interaction, order_id: str):
     name="checkusername",
     description="Admin: view the full activity log of a username"
 )
-@app_commands.checks.has_permissions(administrator=True)
+@admin_check()
 @app_commands.describe(username="Exact Discord username to inspect")
 async def checkusername(interaction: discord.Interaction, username: str):
     username = username.strip().lstrip("@").strip()
@@ -7731,10 +7833,15 @@ async def resolve_panel_channel(channel_id):
     channel = bot.get_channel(channel_id)
 
     if channel is not None:
+        if not POLICY.allowed_guild(getattr(getattr(channel, 'guild', None), 'id', None)):
+            return None, 'forbidden'
         return channel, None
 
     try:
-        return await bot.fetch_channel(channel_id), None
+        channel = await bot.fetch_channel(channel_id)
+        if not POLICY.allowed_guild(getattr(getattr(channel, 'guild', None), 'id', None)):
+            return None, 'forbidden'
+        return channel, None
     except discord.NotFound:
         return None, "not_found"
     except discord.Forbidden:
@@ -7752,11 +7859,9 @@ def parse_channel_id(value):
 
 @tree.command(
     name="setstockmessage",
-    description="Create/update the shop panel in a channel (any server the bot is in)"
+    description="Create/update the shop panel in a channel (authorized servers only)"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_check()
 @app_commands.describe(
     channel_id="Channel ID to post the panel in (leave empty for the default channel)"
 )
@@ -7811,14 +7916,14 @@ async def setstockmessage(
         )
         return
 
-    # Only the bot owners (ADMIN_IDS) may post into another server.
+    # Only configured administrators may post in another explicitly allowed server.
     if explicit:
         same_server = (
             interaction.guild is not None
             and channel.guild.id == interaction.guild.id
         )
 
-        if not same_server and interaction.user.id not in ADMIN_IDS:
+        if not same_server and interaction.user.id not in POLICY.config['admin_user_ids']:
             await fail(
                 "❌ Bạn chỉ có thể đặt panel trong kênh của server này.",
                 "❌ You can only post the panel in a channel of this server."
@@ -7919,9 +8024,7 @@ async def setstockmessage(
     name="removestockmessage",
     description="Stop showing the shop panel in a channel and delete it"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_check()
 @app_commands.describe(
     channel_id="Channel ID whose panel should be removed"
 )
@@ -7964,9 +8067,9 @@ async def removestockmessage(
             and getattr(channel, "guild", None) is not None
             and channel.guild.id == interaction.guild.id
         )
-        allowed = same_server or interaction.user.id in ADMIN_IDS
+        allowed = same_server or interaction.user.id in POLICY.config['admin_user_ids']
     else:
-        allowed = interaction.user.id in ADMIN_IDS
+        allowed = interaction.user.id in POLICY.config['admin_user_ids']
 
     if not allowed:
         await fail(
@@ -8029,41 +8132,26 @@ async def removestockmessage(
 
 @tasks.loop(seconds=5)
 async def main_loop():
-
-    # STOCK - AUTO UPDATE EVERY 5 SECONDS
     try:
-
         await update_stock_message()
-
-    except Exception as e:
-
-        print(
-            f"[LOOP] Stock error: {e}"
-        )
+    except Exception as exc:
+        logging.warning('[STOCK] Panel refresh failed (%s)', type(exc).__name__)
 
 
-    # VCB
+@tasks.loop(seconds=30)
+async def bank_loop():
     try:
-
         await process_bank_transactions()
-
-    except Exception as e:
-
-        print(
-            f"[LOOP] VCB error: {e}"
-        )
+    except Exception as exc:
+        await service_result('bank', False, type(exc).__name__)
 
 
-    # CRYPTO
+@tasks.loop(seconds=30)
+async def crypto_loop():
     try:
-
         await process_crypto_orders()
-
-    except Exception as e:
-
-        print(
-            f"[LOOP] Crypto error: {e}"
-        )
+    except Exception as exc:
+        await service_result('crypto', False, type(exc).__name__)
 
 
 # =========================================================
@@ -8084,6 +8172,8 @@ async def order_cleanup_loop():
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
+    if interaction.guild is not None and not POLICY.allowed_guild(interaction.guild.id):
+        return
     try:
         user = interaction.user
         data = interaction.data or {}
@@ -8998,8 +9088,9 @@ def is_staff(
 
         return False
 
-    if member.guild_permissions.administrator:
-
+    if not POLICY.allowed_guild(member.guild.id):
+        return False
+    if member.guild_permissions.administrator and member.id in POLICY.config['admin_user_ids']:
         return True
 
     role = get_staff_role(
@@ -9467,6 +9558,8 @@ class LanguageView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         set_language(
             interaction.user.id,
             "en"
@@ -9499,6 +9592,8 @@ class LanguageView(
         button: discord.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         set_language(
             interaction.user.id,
             "vi"
@@ -9546,6 +9641,8 @@ class TicketPanelView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         await create_ticket_for_user(
             interaction
         )
@@ -9561,6 +9658,8 @@ class TicketPanelView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         set_language(
             interaction.user.id,
             "en"
@@ -9593,6 +9692,8 @@ class TicketPanelView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         set_language(
             interaction.user.id,
             "vi"
@@ -9944,6 +10045,8 @@ class DeleteConfirmView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         channel = interaction.channel
 
         if channel is None:
@@ -10024,6 +10127,8 @@ class DeleteConfirmView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         ticket_data = get_ticket_data(
             interaction.guild.id,
             self.channel_id
@@ -10096,6 +10201,8 @@ class CloseTicketModal(
         interaction: discord.Interaction
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         guild = interaction.guild
 
         channel = interaction.channel
@@ -10315,6 +10422,8 @@ class TicketControlView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         guild = interaction.guild
 
         channel = interaction.channel
@@ -10434,6 +10543,8 @@ class TicketControlView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         guild = interaction.guild
 
         channel = interaction.channel
@@ -10539,6 +10650,8 @@ class ClosedTicketView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         guild = interaction.guild
 
         channel = interaction.channel
@@ -10700,6 +10813,8 @@ class ClosedTicketView(
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         ticket_data = get_ticket_data(
             interaction.guild.id,
             interaction.channel.id
@@ -11060,10 +11175,7 @@ ANNOUNCE_CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 # ADMIN USER IDS
 # =========================================================
 
-ADMIN_IDS = {
-    920604650602909767,
-    909652269723693077,
-}
+# Administrator IDs are configured in operations.json, not in application source.
 
 
 # =========================================================
@@ -11105,7 +11217,7 @@ def is_admin(
     interaction: discord.Interaction
 ) -> bool:
 
-    return interaction.user.id in ADMIN_IDS
+    return can_manage(interaction)
 
 
 # =========================================================
@@ -11181,6 +11293,8 @@ class VerifyView(discord.ui.View):
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         if interaction.guild is None:
 
             await interaction.response.send_message(
@@ -11432,6 +11546,8 @@ class AnnouncementView(discord.ui.View):
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         self.language = "vn"
         self.page = 0
 
@@ -11458,6 +11574,8 @@ class AnnouncementView(discord.ui.View):
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         self.language = "en"
         self.page = 0
 
@@ -11484,6 +11602,8 @@ class AnnouncementView(discord.ui.View):
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         if self.page > 0:
             self.page -= 1
 
@@ -11510,6 +11630,8 @@ class AnnouncementView(discord.ui.View):
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         pages = self.current_pages()
 
         if self.page < len(pages) - 1:
@@ -11538,6 +11660,8 @@ class AnnouncementView(discord.ui.View):
         button: discord.ui.Button
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         if not is_admin(interaction):
 
             await interaction.response.send_message(
@@ -11652,6 +11776,8 @@ class EditAnnouncementModal(
         interaction: discord.Interaction
     ):
 
+        if not await ensure_allowed_interaction(interaction):
+            return False
         if not is_admin(interaction):
 
             await interaction.response.send_message(
@@ -11798,6 +11924,11 @@ class AnnouncementModal(
         interaction: discord.Interaction
     ):
 
+        if not can_manage(interaction):
+            await interaction.response.send_message('❌ Bạn không có quyền đăng thông báo.', ephemeral=True)
+            return
+        if not await ensure_allowed_interaction(interaction):
+            return False
         if interaction.guild is None:
 
             await interaction.response.send_message(
@@ -11848,6 +11979,10 @@ class AnnouncementModal(
                 )
 
                 return
+
+        if getattr(getattr(channel, 'guild', None), 'id', None) != interaction.guild.id:
+            await interaction.response.send_message('❌ Kênh thông báo không thuộc server này.', ephemeral=True)
+            return
 
         vietnamese = (
             self.vn_part1.value.strip()
@@ -12232,6 +12367,12 @@ ANNOUNCE_COMMAND_NAMES = {"setchannel", "announce", "verify"}
 
 @bot.event
 async def on_ready():
+    await bootstrap_policy()
+    bank_loop.change_interval(seconds=POLICY.config['bank_poll_seconds'])
+    crypto_loop.change_interval(seconds=POLICY.config['crypto_poll_seconds'])
+    for background in (bank_loop, crypto_loop, maintenance_loop, delivery_retry_loop):
+        if not background.is_running():
+            background.start()
 
     print(
         f"Logged in as "
@@ -12363,13 +12504,13 @@ async def on_app_command_error(
 
     elif isinstance(
         error,
-        app_commands.errors.MissingPermissions
+        app_commands.errors.CheckFailure
     ):
 
         message = pick(
             err_lang,
-            "❌ Bạn không có quyền sử dụng command này.",
-            "❌ You do not have permission to use this command."
+            "❌ Server hoặc Discord ID của bạn chưa được cấp quyền trong operations.json.",
+            "❌ This server or your Discord ID is not authorized in operations.json."
         )
 
     else:
@@ -12411,6 +12552,7 @@ async def on_app_command_error(
 # =========================================================
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if not BOT_TOKEN:
         raise FileNotFoundError("Set DISCORD_BOT_TOKEN or create input/token.txt")
     try:

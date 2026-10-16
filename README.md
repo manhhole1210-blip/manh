@@ -1,5 +1,11 @@
 # Lemon Cookie — bot Discord dùng SQLite
 
+**Bản vận hành 24/24:** xem [WINDOWS_VPS.md](WINDOWS_VPS.md) để nâng cấp, cấu hình
+server/admin, chạy tự động trên VPS Windows, sao lưu/khôi phục và đối soát thanh toán.
+Các lệnh mới: `/redeliver`, `/downloadorder`, `/pendingtopups`, `/reconciletopup`,
+`/ignoretopup`, `/backup`, `/botstatus`. Cần chép toàn bộ mã `.py` của bản mới,
+không chỉ `main.py`; giữ nguyên `data`, cấu hình riêng, token và backup.
+
 Bản chuyển đổi từ `main.py` được cung cấp. Giữ các lệnh shop, thanh toán,
 ticket và thông báo. Database được tạo tại `data/bot.db`; dùng `sqlite3` có
 sẵn trong Python, không cần cài máy chủ SQLite hay thư viện database riêng.
@@ -107,7 +113,7 @@ không tự tạo lại. Kho đang bán của sản phẩm cũng được xóa t
 cuối cùng, màn hình mua báo shop chưa có sản phẩm. Có thể dùng `/addproduct` để
 tạo sản phẩm mới, kể cả dùng lại tên cũ; sản phẩm mới có ID và kho riêng.
 
-Bản cập nhật này cần chép đè **cả `main.py` và `sqlite_store.py`**, rồi khởi động lại
+Khi nâng cấp, chép toàn bộ mã `.py` mới theo hướng dẫn WINDOWS_VPS.md rồi khởi động lại
 bot. Việc cập nhật mã không tự xóa sản phẩm; quản trị viên thực hiện `/removeproduct`
 trên Discord khi muốn xóa.
 
@@ -137,12 +143,10 @@ Có thể tạo bản sao nhất quán trong lúc bot chạy bằng SQLite Backu
 .venv/bin/python sqlite_store.py --backup backups/bot-2026-10-16.db
 ```
 
-Dùng tên mới cho mỗi bản sao; công cụ không ghi đè bản sao đã tồn tại. Để khôi phục:
-dừng bot, giữ một bản sao nguyên trạng của thư mục `data/` hiện tại để có thể quay lại,
-rồi đặt bản sao SQLite đã chọn vào **thư mục `data/` mới**, tên `bot.db`. Không ghép
-`bot.db` được khôi phục với các tệp `bot.db-wal` hoặc `bot.db-shm` của database cũ.
-Khởi động bot và đối chiếu số dư/kho trước khi phục vụ khách.
-Sao lưu riêng token/config crypto vì chúng không được đưa vào database.
+Dùng tên mới cho mỗi bản sao; công cụ không ghi đè bản sao đã tồn tại. Nên dùng
+`manage_bot.py backup` và `manage_bot.py restore` theo [hướng dẫn vận hành](WINDOWS_VPS.md)
+để kiểm tra toàn vẹn, giữ bản trước restore và tạm dừng thanh toán chống cộng lại giao dịch.
+Sao lưu riêng token/config crypto và `operations.json` vì chúng không được đưa vào database.
 
 Không xóa `bot.db`, và không sao chép riêng tệp này khi bot đang chạy: các giao dịch
 mới có thể còn trong WAL. Database và bản sao lưu chứa số dư và thông tin account;
@@ -155,19 +159,21 @@ chúng được loại khỏi Git.
 - `processed_transactions`: mã giao dịch ngân hàng là khóa chính, chống trùng ID.
 - `stock`: nội dung kho theo sản phẩm, giữ nguyên byte khi chuyển từ TXT.
 - `documents`: cấu hình, giá, sản phẩm, ticket, lịch sử, ngôn ngữ và bản lưu đơn.
-- `metadata`: đánh dấu migration đã hoàn tất.
+- `deliveries`: hàng đợi và trạng thái giao hàng bền vững.
+- `bank_payments`, `payment_claims`: đối soát ngân hàng và khóa chống cộng trùng crypto.
+- `metadata`: phiên bản nâng cấp và trạng thái tạm dừng thanh toán sau restore.
 
 Mua hàng và cộng tiền sử dụng `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`, WAL và
 `synchronous=FULL`. Khi lỗi, số dư/kho/đơn không được lưu dở dang; trạng thái tài chính
 trong bộ nhớ cũng được phục hồi. Giao hàng Discord diễn ra sau khi commit. Cơ chế
-xóa đơn hết hạn bảo hành/14 ngày được giữ và áp dụng lên database.
+xóa đơn hết hạn bảo hành/14 ngày được giữ; đơn chưa giao được không bị dọn.
 
 Đây là bước chuyển lưu trữ, chưa chuẩn hóa mọi trường thành cột SQL riêng: cấu trúc
-JSON nghiệp vụ và cách biểu diễn số dư của bot cũ được giữ. Khi lưu một tập người dùng
+JSON nghiệp vụ được giữ, còn tiền VND được chuẩn hóa thành số nguyên chính xác. Khi lưu một tập người dùng
 hoặc đơn, adapter vẫn cập nhật cả tập; phù hợp một tiến trình, chưa tối ưu cho kho lớn
 hoặc nhiều bot cùng truy cập. Không sửa database trực tiếp trong lúc bot đang chạy vì
-bot còn giữ số dư và thanh toán trong bộ nhớ. Các vấn đề phân quyền nhiều server của
-bot gốc không nằm trong thay đổi này.
+bot còn giữ số dư và thanh toán trong bộ nhớ. Quyền server/admin được cấu hình riêng
+trong `operations.json`; xem WINDOWS_VPS.md.
 
 ## Kiểm thử
 
@@ -176,5 +182,8 @@ bot gốc không nằm trong thay đổi này.
 ```
 
 Có kiểm thử migration, giữ bản sao dữ liệu gốc, khởi động lại, rollback, backup WAL,
-nhập/xóa kho, mua hàng thật qua callback và chống cộng trùng nạp ngân hàng/crypto.
+nhập/xóa kho, luồng mua qua callback giả lập và chống cộng trùng nạp ngân hàng/crypto.
 Discord và API thanh toán được giả lập, không tạo giao dịch hoặc gửi tin nhắn thật.
+
+GitHub Actions chạy bộ kiểm thử trên Ubuntu và Windows/Python 3.12, đồng thời kiểm tra
+cú pháp các script PowerShell trên Windows. Kết quả từng lần chạy nằm trong tab Actions.
