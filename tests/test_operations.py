@@ -52,6 +52,37 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(self.store.load_json(path, {})['42']['balance'], 12345.5)
         self.assertIsNone(self.store.db.execute("SELECT 1 FROM metadata WHERE key='integer_vnd_v1'").fetchone())
 
+    def test_historical_logs_and_notifications_are_preserved_without_blocking_upgrade(self):
+        historical = {
+            'data/activity_logs.json': {'42': [{'details': {'total': 'unknown', 'amount_vnd': 1.5, 'balance_before': -3}}]},
+            'data/topup_history.json': [{'amount_vnd': 10.25, 'status': 'legacy'}],
+            'data/balance_dm.json': {'old-message': {'amount': 'unavailable', 'old_balance': 2.5}},
+            'tickets.json': {'ticket': {'total': 'not money'}},
+        }
+        for key, value in historical.items():
+            self.store.save_json(self.root / key, value)
+        users = self.root / 'data/users.json'
+        self.store.save_json(users, {'42': {'balance': 1000.0}})
+        before = {key: self.store.db.execute('SELECT payload FROM documents WHERE path=?', (key,)).fetchone()[0] for key in historical}
+        self.store.upgrade_vnd()
+        self.assertIs(type(self.store.load_json(users, {})['42']['balance']), int)
+        for key, value in historical.items():
+            self.assertEqual(self.store.load_json(self.root / key, None), value)
+            self.assertEqual(self.store.db.execute('SELECT payload FROM documents WHERE path=?', (key,)).fetchone()[0], before[key])
+
+    def test_current_price_and_order_fractions_still_block_upgrade(self):
+        for key, value in (
+            ('data/orders.json', {'order': {'unit_price': 10.5, 'total': 10.5}}),
+            ('data/products.json', {'products': [{'price': 10.5}]}),
+            ('data/prices.json', {'tiers': [{'price': 10.5}]}),
+        ):
+            with self.subTest(key=key):
+                self.store.save_json(self.root / key, value)
+                with self.assertRaisesRegex(ValueError, 'No balances were changed'):
+                    self.store.upgrade_vnd()
+                self.assertEqual(self.store.load_json(self.root / key, None), value)
+                self.store.delete(self.root / key)
+
     def test_policy_requires_guild_id_admin_id_and_permission(self):
         policy = RuntimePolicy(self.root)
         policy.config.update(allowed_guild_ids=[123], admin_user_ids=[42])

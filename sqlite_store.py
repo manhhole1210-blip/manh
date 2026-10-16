@@ -221,21 +221,58 @@ class SQLiteStore:
         from money import vnd
         if self.db.execute("SELECT 1 FROM metadata WHERE key='integer_vnd_v1'").fetchone():
             return
-        fields = {'balance', 'unit_price', 'total', 'credit_vnd', 'amount_vnd',
-                  'old_balance', 'new_balance', 'balance_before', 'balance_after', 'price', 'price_tier_1', 'price_tier_2', 'price_tier_3', 'price_tier_4'}
-        def convert(value):
-            if isinstance(value, dict):
-                return {k: vnd(v) if k in fields and v is not None else convert(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [convert(item) for item in value]
-            return value
+        def row_money(row, fields):
+            if not isinstance(row, dict):
+                raise ValueError('Expected a financial record')
+            updated = dict(row)
+            for field in fields:
+                if field in updated:
+                    updated[field] = vnd(updated[field])
+            return updated
+
+        def tier_prices(tiers):
+            if not isinstance(tiers, list):
+                raise ValueError('Expected a price-tier list')
+            return [row_money(tier, ('price',)) for tier in tiers]
+
         changes = []
         for key, payload in self.db.execute('SELECT path, payload FROM documents').fetchall():
+            # Only live financial schemas are authoritative. Audit trails, top-up
+            # history and old notification payloads are immutable historical evidence;
+            # a field named "total" there is not necessarily a current VND balance.
+            selected = key in {
+                'data/users.json', 'data/orders.json', 'data/crypto_orders.json',
+                'data/products.json', 'data/prices.json', 'data/config.json',
+            } or (key.startswith('data/orders/') and key.endswith('.json'))
+            if not selected:
+                continue
             value = self.load_json(self.root / key, None)
-            if key == 'data/balance_dm.json' and isinstance(value, dict):
-                value = {k: {**item, 'amount': vnd(item['amount'])} if isinstance(item, dict) and 'amount' in item else item for k, item in value.items()}
             try:
-                changes.append((self.root / key, convert(value)))
+                if key in ('data/users.json', 'data/orders.json', 'data/crypto_orders.json'):
+                    if not isinstance(value, dict):
+                        raise ValueError('Expected a financial collection')
+                    fields = {'data/users.json': ('balance',),
+                              'data/orders.json': ('unit_price', 'total'),
+                              'data/crypto_orders.json': ('credit_vnd',)}[key]
+                    updated = {item_id: row_money(row, fields) for item_id, row in value.items()}
+                elif key.startswith('data/orders/'):
+                    updated = row_money(value, ('unit_price', 'total'))
+                elif key == 'data/products.json':
+                    updated = row_money(value, ())
+                    products = value.get('products', [])
+                    if not isinstance(products, list):
+                        raise ValueError('Expected a product list')
+                    updated['products'] = []
+                    for product in products:
+                        product = row_money(product, ('price',))
+                        if 'tiers' in product:
+                            product['tiers'] = tier_prices(product['tiers'])
+                        updated['products'].append(product)
+                else:
+                    updated = row_money(value, ('price_tier_1', 'price_tier_2', 'price_tier_3', 'price_tier_4'))
+                    if key == 'data/prices.json' and 'tiers' in updated:
+                        updated['tiers'] = tier_prices(updated['tiers'])
+                changes.append((self.root / key, updated))
             except ValueError:
                 raise ValueError(f'Invalid/fractional VND in {key}; reconcile it before upgrading. No balances were changed') from None
         from operations import snapshot_database, utc_stamp

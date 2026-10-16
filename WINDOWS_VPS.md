@@ -23,7 +23,8 @@ Các script PowerShell chưa được chạy trên máy Windows thật trong mô
 
 Bản nâng cấp tự sao lưu trước khi chuyển các trường tiền VND sang số nguyên. Số dư
 cũ như `10000.0` chuyển chính xác thành `10000`; số dư có phần lẻ như `10000.5` khiến
-nâng cấp dừng, chỉ rõ tài liệu chứa lỗi để đối chiếu. Không tự làm tròn hoặc xóa sổ cái. Riêng quy đổi crypto dùng Decimal và quy tắc
+nâng cấp dừng, chỉ rõ tài liệu chứa lỗi để đối chiếu. Nhật ký hoạt động, lịch sử nạp và thông báo cũ được giữ nguyên, không ép đổi các
+trường lịch sử sang số nguyên. Không tự làm tròn hoặc xóa sổ cái. Riêng quy đổi crypto dùng Decimal và quy tắc
 làm tròn nửa lên (ROUND_HALF_UP) đến một đồng; số tiền USD được lưu dạng chuỗi thập phân.
 
 ## Cấu hình quyền và cảnh báo
