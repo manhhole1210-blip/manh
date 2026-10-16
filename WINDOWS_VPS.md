@@ -152,7 +152,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall-windows.ps1
   dừng thanh toán. Backup và đối soát chỉ dành cho admin được cấp quyền.
 
 Bank và crypto chạy các vòng kiểm tra riêng (mặc định 30 giây); panel vẫn cập nhật
-mỗi 5 giây. Không in toàn bộ nội dung/số tài khoản ngân hàng mỗi lần kiểm tra. API bank
+kiểm tra thay đổi mỗi 5 giây (không sửa tin nhắn nếu nội dung giữ nguyên). Không in toàn bộ nội dung/số tài khoản ngân hàng mỗi lần kiểm tra. API bank
 lỗi 3 lần liên tiếp sẽ cảnh báo, nhắc lại tối đa mỗi giờ và báo khi phục hồi. Ngưỡng và
 chu kỳ có thể chỉnh trong `operations.json`, khởi động lại để áp dụng.
 
@@ -207,3 +207,17 @@ Khi báo lỗi quyền sync, kiểm tra bot được mời với scope `bot` và
 không phải DM; tải lại Discord bằng Ctrl+R. Nếu vẫn bị ẩn, quản trị server cần kiểm tra
 Server Settings > Integrations > Lemon > Commands và quyền Use Application Commands
 của người dùng/kênh. Không xóa database để xử lý lỗi hiển thị slash command.
+
+## Cảnh báo HTTP 429 khi sửa panel
+
+Bản mới chỉ PATCH tin nhắn khi nội dung kho/giá/nút thay đổi, bỏ timestamp khỏi phép
+so sánh, gộp các thay đổi nhanh với khoảng cách tối thiểu 10 giây và chỉ kiểm tra panel
+còn tồn tại mỗi 5 phút khi nội dung giữ nguyên. Gặp lỗi sẽ chờ trước khi thử lại;
+không tắt cơ chế rate limit của discord.py. Logger Discord dùng chung một handler,
+tránh in hai lần cùng cảnh báo. Chỉ chạy một bản bot dùng cùng token, kể cả trên các
+máy hoặc thư mục khác nhau; khóa local không ngăn được hai máy chạy chung token.
+
+Lệnh quản trị chỉ đăng ký ở server đã cấp quyền. Bản toàn cục chỉ giữ các lệnh khách
+hàng dùng trong DM của bot; không còn hiển thị hai bản cùng tên trong server. Sau khi
+cập nhật main.py, khởi động lại và chờ cả sync server và sync global thành công, rồi
+Ctrl+R trên Discord để làm mới danh sách lệnh cũ.

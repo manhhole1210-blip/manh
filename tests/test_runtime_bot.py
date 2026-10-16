@@ -3,7 +3,7 @@ import importlib.util
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import test_bot_sqlite as baseline
 
@@ -247,6 +247,70 @@ class RuntimeBotTests(unittest.TestCase):
             await self.bot.sync_application_commands()
             self.assertEqual(self.bot.bot._synced_command_scopes, {123, 'global'})
             self.assertEqual(self.bot.tree.sync.await_count, 3)
+        asyncio.run(scenario())
+
+    def test_panel_does_not_edit_unchanged_stock_and_coalesces_fast_changes(self):
+        from unittest.mock import Mock
+        async def scenario():
+            clock = [100.0]
+            self.bot.build_panel_banner = lambda *args: None
+            message = SimpleNamespace(id=555, edit=AsyncMock())
+            channel = SimpleNamespace(guild=SimpleNamespace(id=123), fetch_message=AsyncMock(return_value=message), send=AsyncMock())
+            self.bot.bot.get_channel = lambda _: channel
+            panels = {'1234': {'message_id':555, 'banner':False}}
+            with patch.object(self.bot.time, 'monotonic', side_effect=lambda: clock[0]):
+                self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'ok')
+                self.assertEqual(message.edit.await_count, 1)
+                for _ in range(10):
+                    clock[0] += 5
+                    self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'ok')
+                self.assertEqual(message.edit.await_count, 1)
+                self.assertEqual(channel.fetch_message.await_count, 1)
+                self.bot.save_stock(['changed:account'])
+                self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'ok')
+                self.assertEqual(message.edit.await_count, 2)
+                clock[0] += 1
+                self.bot.save_stock(['latest:account', 'another:account', 'third:account'])
+                self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'deferred')
+                self.assertEqual(message.edit.await_count, 2)
+                clock[0] += self.bot.PANEL_MIN_EDIT_SECONDS
+                self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'ok')
+                self.assertEqual(message.edit.await_count, 3)
+                clock[0] += self.bot.PANEL_VERIFY_SECONDS + 1
+                self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'ok')
+                self.assertEqual(message.edit.await_count, 3)
+        asyncio.run(scenario())
+
+    def test_panel_error_backs_off_instead_of_sending_every_poll(self):
+        async def scenario():
+            self.bot.build_panel_banner = lambda *args: None
+            message = SimpleNamespace(id=555, edit=AsyncMock(side_effect=OSError('fixture failure')))
+            channel = SimpleNamespace(guild=SimpleNamespace(id=123), fetch_message=AsyncMock(return_value=message))
+            self.bot.bot.get_channel = lambda _: channel
+            panels = {'1234': {'message_id':555, 'banner':False}}
+            self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'error')
+            self.assertEqual(await self.bot.update_stock_panel(1234, panels), 'deferred')
+            self.assertEqual(message.edit.await_count, 1)
+            self.assertEqual(channel.fetch_message.await_count, 1)
+        asyncio.run(scenario())
+
+    def test_global_commands_are_dm_only_and_local_dispatch_is_preserved(self):
+        async def scenario():
+            published = {}
+            async def fake_sync(*, guild=None):
+                commands = self.bot.tree.get_commands(guild=guild)
+                published[guild.id if guild else 'global'] = [command.to_dict(self.bot.tree) for command in commands]
+                return commands
+            self.bot.tree.sync = AsyncMock(side_effect=fake_sync)
+            await self.bot.sync_application_commands()
+            guild_names = {command['name'] for command in published[123]}
+            self.assertIn('pendingtopups', guild_names)
+            global_names = {command['name'] for command in published['global']}
+            self.assertNotIn('pendingtopups', global_names)
+            self.assertIn('redeliver', global_names)
+            for command in published['global']:
+                self.assertEqual(command['contexts'], [1])
+            self.assertIsNotNone(self.bot.tree.get_command('pendingtopups'))
         asyncio.run(scenario())
 
 

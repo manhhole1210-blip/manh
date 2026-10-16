@@ -1141,7 +1141,7 @@ def remove_product_tier(product_id, min_qty):
     for item in data["products"]:
         if item["id"] == product_id:
             status, new, removed = remove_tier(item["tiers"], min_qty)
-            if status == "ok":
+            if status in ("ok", "deferred"):
                 item["tiers"] = new
                 item["price"] = new[0]["price"]
                 save_products_data(data)
@@ -2796,8 +2796,8 @@ def build_panel_embed(language="vi"):
     embed.set_footer(
         text=SHOP_FOOTER + pick(
             lang,
-            " • Cập nhật mỗi 5 giây",
-            " • Updates every 5 seconds"
+            " • Tự cập nhật khi kho thay đổi",
+            " • Updates when stock changes"
         )
     )
 
@@ -3599,104 +3599,84 @@ def load_stock_panels():
     return panels
 
 
+PANEL_MIN_EDIT_SECONDS = 10
+PANEL_VERIFY_SECONDS = 300
+_PANEL_RENDER_STATE = {}
+_PANEL_RETRY_AFTER = {}
+
+
+def panel_render_digest(embed, view):
+    payload = embed.to_dict()
+    payload.pop('timestamp', None)  # Rendering time is not a stock change.
+    return hashlib.sha256(json.dumps({'embed': payload, 'view': view.to_components()},
+                                    sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
 async def update_stock_panel(channel_id, panels):
-    """Create or refresh the shop panel of ONE channel.
-
-    Returns "ok", "not_found", "forbidden" or "error". On success the
-    channel is recorded in `panels` (the caller saves the file).
-    """
-
+    """Only edit changed content; periodic GET verifies that the panel still exists."""
     global _BANNER_UPGRADE_FAILED
-
     channel_id = int(channel_id)
+    now = time.monotonic()
+    if now < _PANEL_RETRY_AFTER.get(channel_id, 0):
+        return 'deferred'
     key = str(channel_id)
-    saved = dict(panels.get(key) or {"message_id": None, "banner": False})
-
-    embed = build_stock_embed("vi")
-
-    channel = bot.get_channel(channel_id)
-
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except discord.NotFound:
-            return "not_found"
-        except discord.Forbidden:
-            return "forbidden"
-        except Exception as e:
-            print(f"[STOCK] Channel error ({channel_id}): {e}")
-            return "error"
-
-    if not POLICY.allowed_guild(getattr(getattr(channel, 'guild', None), 'id', None)):
-        return 'forbidden'
-    message_id = saved.get("message_id")
-    banner_ready = bool(saved.get("banner"))
-
+    saved = dict(panels.get(key) or {'message_id': None, 'banner': False})
+    embed = build_stock_embed('vi')
+    view = ShopPanelView('vi')
+    digest = panel_render_digest(embed, view)
+    message_id = saved.get('message_id')
+    state = _PANEL_RENDER_STATE.get(channel_id)
+    if state and state['message_id'] == message_id:
+        if state['digest'] == digest and now - state['verified_at'] < PANEL_VERIFY_SECONDS:
+            return 'ok'
+        if now - state['edited_at'] < PANEL_MIN_EDIT_SECONDS:
+            return 'deferred'  # Keep the old digest so the next poll applies the latest stock.
+    else:
+        state = None
     try:
-
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        if not POLICY.allowed_guild(getattr(getattr(channel, 'guild', None), 'id', None)):
+            return 'forbidden'
+        message = None
         if message_id:
-
             try:
-                message = await channel.fetch_message(
-                    int(message_id)
-                )
-
-                if (
-                    build_panel_banner("vi")
-                    and not banner_ready
-                    and not _BANNER_UPGRADE_FAILED
-                ):
-                    # One-time upgrade of an older panel message: attach the
-                    # banner so the new layout shows its image.
-                    try:
-                        attach = panel_banner_attach("vi")
-                        await message.edit(
-                            embed=embed,
-                            view=ShopPanelView(),
-                            attachments=[attach["file"]]
-                        )
-                        saved["banner"] = True
-                        panels[key] = saved
-                        return "ok"
-
-                    except discord.NotFound:
-                        raise
-
-                    except Exception as upgrade_error:
-                        _BANNER_UPGRADE_FAILED = True
-                        print(
-                            f"[STOCK] Banner upgrade skipped: {upgrade_error}"
-                        )
-
-                await message.edit(
-                    embed=embed,
-                    view=ShopPanelView()
-                )
-
-                panels[key] = saved
-                return "ok"
-
+                message = await channel.fetch_message(int(message_id))
             except discord.NotFound:
-                pass
-
-        message = await channel.send(
-            embed=embed,
-            view=ShopPanelView("vi"),
-            **panel_banner_attach("vi")
-        )
-
-        panels[key] = {
-            "message_id": message.id,
-            "banner": bool(build_panel_banner("vi"))
-        }
-        return "ok"
-
+                state = None
+        if message is not None:
+            if state and state['digest'] == digest:
+                state['verified_at'] = time.monotonic()
+                return 'ok'
+            if build_panel_banner('vi') and not saved.get('banner') and not _BANNER_UPGRADE_FAILED:
+                attach = panel_banner_attach('vi')
+                if attach:
+                    await message.edit(embed=embed, view=view, attachments=[attach['file']])
+                    saved['banner'] = True
+                else:
+                    await message.edit(embed=embed, view=view)
+            else:
+                await message.edit(embed=embed, view=view)
+            panels[key] = saved
+        else:
+            message = await channel.send(embed=embed, view=view, **panel_banner_attach('vi'))
+            panels[key] = {'message_id': message.id, 'banner': bool(build_panel_banner('vi'))}
+        now = time.monotonic()
+        _PANEL_RENDER_STATE[channel_id] = {'message_id': message.id, 'digest': digest,
+                                         'edited_at': now, 'verified_at': now}
+        _PANEL_RETRY_AFTER.pop(channel_id, None)
+        return 'ok'
+    except discord.NotFound:
+        _PANEL_RENDER_STATE.pop(channel_id, None)
+        return 'not_found'
     except discord.Forbidden:
-        return "forbidden"
-
-    except Exception as e:
-        print(f"[STOCK] Update error ({channel_id}): {e}")
-        return "error"
+        _PANEL_RETRY_AFTER[channel_id] = time.monotonic() + 60
+        return 'forbidden'
+    except Exception as exc:
+        # discord.py handles ordinary 429 retries; back off too if it surfaces an error.
+        cooldown = 60 if getattr(exc, 'status', None) == 429 else 30
+        _PANEL_RETRY_AFTER[channel_id] = time.monotonic() + cooldown
+        logging.warning('[STOCK] Panel update failed (%s); backing off %ss', type(exc).__name__, cooldown)
+        return 'error'
 
 
 async def update_stock_message():
@@ -3717,7 +3697,7 @@ async def update_stock_message():
 
         for channel_id, status in zip(channel_ids, results):
 
-            if status == "ok":
+            if status in ("ok", "deferred"):
                 _PANEL_FAILURES.pop(channel_id, None)
                 continue
 
@@ -12366,8 +12346,8 @@ ANNOUNCE_COMMAND_NAMES = {"setchannel", "announce", "verify"}
 # =========================================================
 
 async def sync_application_commands():
-    # Guild commands update immediately and override stale global definitions in
-    # these servers. Keep globals for supported DM commands and other clients.
+    # Guild scopes contain all commands. The global scope contains DM-only
+    # customer commands, so no name is offered twice inside a server.
     synced_scopes = getattr(bot, '_synced_command_scopes', set())
     scopes = [discord.Object(id=gid) for gid in POLICY.config['allowed_guild_ids']] + [None]
     if not POLICY.config['allowed_guild_ids']:
@@ -12381,14 +12361,27 @@ async def sync_application_commands():
                 tree.copy_global_to(guild=guild)
                 synced = await tree.sync(guild=guild)
             else:
-                synced = await tree.sync()
+                originals = tree.get_commands()
+                dm_names = {'help', 'profile', 'history', 'order', 'checkwarranty', 'redeliver', 'downloadorder'}
+                tree.clear_commands(guild=None)
+                try:
+                    for command in originals:
+                        if command.name in dm_names:
+                            private = copy.copy(command)
+                            private.allowed_contexts = app_commands.AppCommandContext(guild=False, dm_channel=True, private_channel=False)
+                            tree.add_command(private)
+                    synced = await tree.sync()
+                finally:
+                    tree.clear_commands(guild=None)
+                    for command in originals:
+                        tree.add_command(command)
             names = {command.name for command in synced}
-            required = {'pendingtopups', 'reconciletopup', 'ignoretopup', 'botstatus'}
+            required = {'pendingtopups', 'reconciletopup', 'ignoretopup', 'botstatus'} if guild else dm_names
             if not required <= names:
                 print(f'[DISCORD] Incomplete sync for {scope_id}; missing: {", ".join(sorted(required - names))}')
                 continue
             synced_scopes.add(scope_id)
-            print(f'[DISCORD] Synced {len(synced)} commands to {scope_id}; /pendingtopups registered.')
+            print(f'[DISCORD] Synced {len(synced)} commands to {scope_id}; ' + ('/pendingtopups registered.' if guild else 'DM-only commands registered.'))
         except Exception as exc:
             print(f'[DISCORD] Command sync failed for {scope_id} ({type(exc).__name__}). Check bot invitation scope applications.commands and server access.')
     bot._synced_command_scopes = synced_scopes
@@ -12565,7 +12558,7 @@ def main():
     if not BOT_TOKEN:
         raise FileNotFoundError("Set DISCORD_BOT_TOKEN or create input/token.txt")
     try:
-        bot.run(BOT_TOKEN)
+        bot.run(BOT_TOKEN, log_handler=None)
     finally:
         STORE.close()
 
