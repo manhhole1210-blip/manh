@@ -191,3 +191,19 @@ dừng bot và bật lại mua hàng và thanh toán tự động bằng:
 
 Các giao dịch đã vào danh sách chờ vẫn cần đối soát bằng lệnh riêng. Không dùng restore
 như thao tác sửa giá hoặc hoàn tiền thông thường.
+
+## Không thấy slash command mới
+
+Bản mới đồng bộ trực tiếp các lệnh vào server trong `allowed_guild_ids` khi đăng
+nhập, sau đó vẫn đồng bộ bản toàn cục cho các lệnh dùng qua DM. Log phải có dòng
+`[DISCORD] Synced ... commands to SERVER_ID; /pendingtopups registered.`.
+Chỉ đồng bộ server đã cấu hình; không tự cấp thêm quyền hoặc tự thêm server khác.
+Các lần reconnect không lặp lại đồng bộ scope đã thành công trong cùng tiến trình;
+scope lỗi được thử lại khi reconnect hoặc khi khởi động lại.
+
+Nếu không có dòng xác nhận này: xem cảnh báo server chưa cấu hình hoặc sync failed.
+Khi báo lỗi quyền sync, kiểm tra bot được mời với scope `bot` và `applications.commands`,
+đúng tài khoản ứng dụng và đúng server. Trong Discord, chạy lệnh ở kênh server,
+không phải DM; tải lại Discord bằng Ctrl+R. Nếu vẫn bị ẩn, quản trị server cần kiểm tra
+Server Settings > Integrations > Lemon > Commands và quyền Use Application Commands
+của người dùng/kênh. Không xóa database để xử lý lỗi hiển thị slash command.

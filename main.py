@@ -12365,36 +12365,45 @@ ANNOUNCE_COMMAND_NAMES = {"setchannel", "announce", "verify"}
 # READY
 # =========================================================
 
+async def sync_application_commands():
+    # Guild commands update immediately and override stale global definitions in
+    # these servers. Keep globals for supported DM commands and other clients.
+    synced_scopes = getattr(bot, '_synced_command_scopes', set())
+    scopes = [discord.Object(id=gid) for gid in POLICY.config['allowed_guild_ids']] + [None]
+    if not POLICY.config['allowed_guild_ids']:
+        print('[DISCORD] No authorized server configured. Stop bot and run manage_bot.py configure --guild-id ID --admin-id ID')
+    for guild in scopes:
+        scope_id = guild.id if guild is not None else 'global'
+        if scope_id in synced_scopes:
+            continue
+        try:
+            if guild is not None:
+                tree.copy_global_to(guild=guild)
+                synced = await tree.sync(guild=guild)
+            else:
+                synced = await tree.sync()
+            names = {command.name for command in synced}
+            required = {'pendingtopups', 'reconciletopup', 'ignoretopup', 'botstatus'}
+            if not required <= names:
+                print(f'[DISCORD] Incomplete sync for {scope_id}; missing: {", ".join(sorted(required - names))}')
+                continue
+            synced_scopes.add(scope_id)
+            print(f'[DISCORD] Synced {len(synced)} commands to {scope_id}; /pendingtopups registered.')
+        except Exception as exc:
+            print(f'[DISCORD] Command sync failed for {scope_id} ({type(exc).__name__}). Check bot invitation scope applications.commands and server access.')
+    bot._synced_command_scopes = synced_scopes
+
+
 @bot.event
 async def on_ready():
     await bootstrap_policy()
+    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    await sync_application_commands()
     bank_loop.change_interval(seconds=POLICY.config['bank_poll_seconds'])
     crypto_loop.change_interval(seconds=POLICY.config['crypto_poll_seconds'])
     for background in (bank_loop, crypto_loop, maintenance_loop, delivery_retry_loop):
         if not background.is_running():
             background.start()
-
-    print(
-        f"Logged in as "
-        f"{bot.user} "
-        f"(ID: {bot.user.id})"
-    )
-
-
-    try:
-
-        synced = await tree.sync()
-
-        print(
-            f"Synced {len(synced)} commands."
-        )
-
-    except Exception as e:
-
-        print(
-            f"[DISCORD] Sync error: {e}"
-        )
-
 
     # Register persistent shop buttons once.
     # This keeps the stock panel buttons working after bot reconnects/restarts.

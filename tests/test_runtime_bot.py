@@ -215,6 +215,40 @@ class RuntimeBotTests(unittest.TestCase):
             self.assertEqual(self.bot.load_orders(), {})
         asyncio.run(scenario())
 
+    def test_guild_sync_registers_pendingtopups_without_waiting_for_globals(self):
+        async def scenario():
+            async def fake_sync(*, guild=None):
+                return self.bot.tree.get_commands(guild=guild)
+            self.bot.tree.sync = AsyncMock(side_effect=fake_sync)
+            await self.bot.sync_application_commands()
+            guild = self.bot.discord.Object(id=123)
+            names = {command.name for command in self.bot.tree.get_commands(guild=guild)}
+            self.assertIn('pendingtopups', names)
+            self.assertIn('reconciletopup', names)
+            self.assertEqual(self.bot.bot._synced_command_scopes, {123, 'global'})
+            self.assertEqual(self.bot.tree.sync.await_count, 2)
+            await self.bot.sync_application_commands()
+            self.assertEqual(self.bot.tree.sync.await_count, 2)
+            self.assertEqual(self.bot.tree.get_commands(guild=self.bot.discord.Object(id=999)), [])
+        asyncio.run(scenario())
+
+    def test_failed_guild_sync_is_retried_without_resyncing_successful_global_scope(self):
+        async def scenario():
+            async def failing(*, guild=None):
+                if guild is not None:
+                    raise OSError('test failure')
+                return self.bot.tree.get_commands()
+            self.bot.tree.sync = AsyncMock(side_effect=failing)
+            await self.bot.sync_application_commands()
+            self.assertEqual(self.bot.bot._synced_command_scopes, {'global'})
+            async def recovered(*, guild=None):
+                return self.bot.tree.get_commands(guild=guild)
+            self.bot.tree.sync.side_effect = recovered
+            await self.bot.sync_application_commands()
+            self.assertEqual(self.bot.bot._synced_command_scopes, {123, 'global'})
+            self.assertEqual(self.bot.tree.sync.await_count, 3)
+        asyncio.run(scenario())
+
 
 if __name__ == '__main__':
     unittest.main()
