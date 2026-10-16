@@ -94,6 +94,23 @@ Lệnh không xóa sản phẩm, không đổi số dư, đơn đã bán hoặc 
 riêng tư báo số đã xóa và số còn lại; panel được cập nhật sau khi lưu SQLite thành công.
 Xóa kho dùng cùng khóa với mua hàng/nhập kho và có rollback khi lỗi ghi dữ liệu.
 
+### Xóa hẳn sản phẩm, kể cả sản phẩm mặc định số 1
+
+Dùng `/removeproduct`, chọn sản phẩm trong gợi ý và bấm xác nhận. Nếu kho còn
+account, bot yêu cầu xác nhận thêm một lần; nếu kho thay đổi giữa các lần xác nhận,
+bot yêu cầu xác nhận lại theo kho mới. Có thể hủy để giữ nguyên dữ liệu.
+
+Sản phẩm đã xóa biến mất khỏi panel, danh sách mua và các gợi ý nhập kho. Với sản
+phẩm mặc định (`default`), trạng thái xóa được lưu trong SQLite nên khởi động lại
+không tự tạo lại. Kho đang bán của sản phẩm cũng được xóa trong cùng transaction;
+đơn đã bán, bảo hành theo đơn, số dư và bản sao lưu cũ được giữ. Nếu xóa sản phẩm
+cuối cùng, màn hình mua báo shop chưa có sản phẩm. Có thể dùng `/addproduct` để
+tạo sản phẩm mới, kể cả dùng lại tên cũ; sản phẩm mới có ID và kho riêng.
+
+Bản cập nhật này cần chép đè **cả `main.py` và `sqlite_store.py`**, rồi khởi động lại
+bot. Việc cập nhật mã không tự xóa sản phẩm; quản trị viên thực hiện `/removeproduct`
+trên Discord khi muốn xóa.
+
 ### Qua dòng lệnh
 
 Dừng bot. Đặt mỗi account trên một dòng trong `input/new_accounts.txt`, sau đó:

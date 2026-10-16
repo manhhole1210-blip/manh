@@ -216,8 +216,10 @@ class SQLiteStore:
             raise ValueError('The import file contains duplicate accounts')
         with self.transaction():
             path = self.root / 'data/accounts.txt'
+            catalog = self.load_json(self.root / 'data/products.json', {'products': []})
+            if product_id == 'default' and catalog.get('default_deleted') is True:
+                raise ValueError('The default product has been removed')
             if product_id != 'default':
-                catalog = self.load_json(self.root / 'data/products.json', {'products': []})
                 product = next((p for p in catalog['products'] if str(p['id']) == product_id), None)
                 if product is None:
                     raise ValueError('Unknown product ID')

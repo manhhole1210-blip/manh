@@ -301,6 +301,106 @@ class BotSQLiteTests(unittest.TestCase):
             self.bot.update_stock_message.assert_not_awaited()
         asyncio.run(scenario())
 
+    def delete_default(self):
+        product = self.bot.get_default_product()
+        _, _, digest = self.bot.product_stock_snapshot(product)
+        return self.bot.remove_product('default', digest)
+
+    def test_remove_default_requires_stock_confirmation_and_persists_after_restart(self):
+        self.bot.save_order('historical-order', {'user_id': 42, 'product_id': 'default', 'accounts': ['sold:password']})
+        status, product = self.bot.remove_product('default')
+        self.assertEqual(status, 'stock_confirmation_required')
+        self.assertIsNotNone(self.bot.get_product_by_id('default'))
+        self.assertEqual(len(self.bot.load_stock()), 2)
+        self.assertEqual(self.delete_default()[0], 'removed')
+        self.assertEqual(self.bot.load_stock(), [])
+        self.assertEqual(self.bot.get_all_products(), [])
+        self.assertEqual(self.bot.get_user_balance(42), 10000)
+        self.assertIn('historical-order', self.bot.load_orders())
+        self.bot.STORE.close()
+        self.bot._PROCESS_LOCK.close()
+        spec = importlib.util.spec_from_file_location('restarted_bot', self.root / 'main.py')
+        restarted = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(restarted)
+        self.bot = restarted
+        self.assertEqual(self.bot.get_all_products(), [])
+        self.assertTrue(self.bot.load_products_data()['default_deleted'])
+        self.assertIn('historical-order', self.bot.load_orders())
+        self.assertEqual(self.bot.remove_product('default')[0], 'not_found')
+
+    def test_remove_default_command_confirmation_and_stale_digest(self):
+        async def scenario():
+            interaction = self.upload_interaction()
+            choices = await self.bot.removeproduct_autocomplete(interaction, '')
+            self.assertIn('default', [choice.value for choice in choices])
+            await self.bot.removeproduct.callback(interaction, 'default')
+            first = interaction.response.send_message.call_args.kwargs['view']
+            first_click = self.upload_interaction()
+            await first.confirm_button.callback(first_click)
+            second = first_click.edit_original_response.call_args.kwargs['view']
+            self.assertIsNotNone(self.bot.get_product_by_id('default'))
+            self.bot.save_stock(['account1:pass1', 'account2:pass2', 'new:account'])
+            second_click = self.upload_interaction()
+            await second.confirm_button.callback(second_click)
+            refreshed = second_click.edit_original_response.call_args.kwargs['view']
+            self.assertIsNotNone(self.bot.get_product_by_id('default'))
+            self.assertEqual(len(self.bot.load_stock()), 3)
+            final_click = self.upload_interaction()
+            await refreshed.confirm_button.callback(final_click)
+            self.assertIsNone(self.bot.get_product_by_id('default'))
+            self.assertEqual(self.bot.load_stock(), [])
+        asyncio.run(scenario())
+
+    def test_removed_default_cannot_be_bought_or_replenished(self):
+        async def scenario():
+            pending = self.bot.ConfirmBuyView(42, 1, 2500)
+            self.delete_default()
+            interaction = self.upload_interaction()
+            await pending.children[0].callback(interaction)
+            self.assertEqual(self.bot.get_user_balance(42), 10000)
+            self.user.send.assert_not_awaited()
+            file = self.attachment(b'new:account')
+            await self.bot.addstock.callback(self.upload_interaction(), 'default', file)
+            file.read.assert_not_awaited()
+            self.assertEqual(self.bot.load_stock(), [])
+            empty_view = self.bot.ProductSelectView(42, 'vi', self.bot.get_all_products())
+            self.assertEqual(empty_view.children, [])
+            buy = self.upload_interaction()
+            await self.bot.open_buy_flow(buy)
+            self.assertEqual(buy.response.send_message.call_args.kwargs['embed'].title, '📦 Chưa có sản phẩm')
+        asyncio.run(scenario())
+        source = self.root / 'incoming.txt'
+        source.write_text('new:account')
+        with self.assertRaisesRegex(ValueError, 'default product has been removed'):
+            self.bot.STORE.import_stock(source)
+
+    def test_remove_default_keeps_extra_products_and_allows_reusing_name(self):
+        _, extra, _ = self.bot.add_or_update_product('Extra product', 2000, 3)
+        self.bot.save_product_stock(extra, ['extra:password'])
+        self.delete_default()
+        self.assertEqual([p['id'] for p in self.bot.get_all_products()], [extra['id']])
+        status, replacement, _ = self.bot.add_or_update_product(self.bot.PRODUCT_NAME, 3000, 0)
+        self.assertEqual(status, 'added')
+        self.assertNotEqual(replacement['id'], 'default')
+        self.assertIsNone(self.bot.get_product_by_id('default'))
+        self.assertEqual(self.bot.load_product_stock(extra), ['extra:password'])
+        self.bot.build_panel_banner = lambda *args: None
+        fields = self.bot.build_panel_embed().fields
+        self.assertEqual(len(fields), 2)
+        self.assertIn('Extra product', fields[0].name)
+
+    def test_default_removal_rollback_preserves_catalog_and_stock(self):
+        original = self.bot.save_products_data
+        def fail(data):
+            original(data)
+            raise OSError('injected catalog write failure')
+        self.bot.save_products_data = fail
+        with self.assertRaises(OSError):
+            self.delete_default()
+        self.assertIsNotNone(self.bot.get_product_by_id('default'))
+        self.assertEqual(self.bot.load_stock(), ['account1:pass1', 'account2:pass2'])
+        self.assertFalse(self.bot.load_products_data()['default_deleted'])
+
 
 if __name__ == '__main__':
     unittest.main()

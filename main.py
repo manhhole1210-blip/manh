@@ -859,6 +859,7 @@ MAX_PRODUCT_NAME_LENGTH = 60
 def get_default_product():
     return {
         "id": DEFAULT_PRODUCT_ID,
+        "stock_file": "accounts.txt",
         "name": PRODUCT_NAME,
         "tiered": True,
         "tiers": [dict(t) for t in DEFAULT_TIERS],
@@ -903,7 +904,8 @@ def load_products_data():
     except (TypeError, ValueError):
         next_id = len(products) + 1
 
-    return {"next_id": next_id, "products": products}
+    return {"next_id": next_id, "products": products,
+            "default_deleted": data.get("default_deleted") is True}
 
 
 def save_products_data(data):
@@ -920,7 +922,8 @@ def get_extra_products():
 
 
 def get_all_products():
-    return [get_default_product()] + get_extra_products()
+    default = [] if load_products_data()["default_deleted"] else [get_default_product()]
+    return default + get_extra_products()
 
 
 def get_product_by_id(product_id):
@@ -1023,7 +1026,8 @@ def new_product_stock_filename(name, data):
 def product_stock_snapshot(product):
     """Read exact bytes: even whitespace or undecodable contents require confirmation."""
     filename = product["stock_file"]
-    if (filename != os.path.basename(filename) or not filename.startswith("stock_")
+    is_default = product["id"] == DEFAULT_PRODUCT_ID and filename == "accounts.txt"
+    if not is_default and (filename != os.path.basename(filename) or not filename.startswith("stock_")
             or not filename.endswith(".txt")):
         raise ValueError("Invalid product stock filename")
     path = os.path.abspath(product_stock_path(product))
@@ -1040,10 +1044,9 @@ def add_or_update_product(name, price, warranty_days):
     "added", "updated", "default_name", "limit".
     """
 
-    if name.casefold() == PRODUCT_NAME.casefold():
-        return "default_name", None, None
-
     data = load_products_data()
+    if not data["default_deleted"] and name.casefold() == PRODUCT_NAME.casefold():
+        return "default_name", None, None
 
     for item in data["products"]:
         if item["name"].casefold() == name.casefold():
@@ -1160,9 +1163,21 @@ def set_product_warranty(product_id, days):
 
 def remove_product(product_id, confirmed_stock_digest=None):
     """Remove catalog + stock together; nonempty stock needs its exact digest confirmed."""
-    if product_id == DEFAULT_PRODUCT_ID:
-        return "default", None
     data = load_products_data()
+    if product_id == DEFAULT_PRODUCT_ID:
+        if data["default_deleted"]:
+            return "not_found", None
+        product = get_default_product()
+        if any(item["stock_file"].casefold() == "accounts.txt" for item in data["products"]):
+            raise ValueError("Stock is shared by another product; removal blocked")
+        path, content, digest = product_stock_snapshot(product)
+        if content and confirmed_stock_digest != digest:
+            return "stock_confirmation_required", product
+        data["default_deleted"] = True
+        with data_transaction():
+            STORE.delete(path)
+            save_products_data(data)
+        return "removed", product
     for index, item in enumerate(data["products"]):
         if item["id"] != product_id:
             continue
@@ -2897,6 +2912,10 @@ def build_panel_embed(language="vi"):
 
 def build_choose_product_embed(language="vi"):
     lang = "en" if language == "en" else "vi"
+    if not get_all_products():
+        return make_embed(pick(lang, "📦 Chưa có sản phẩm", "📦 No Products Available"),
+                          pick(lang, "Shop hiện chưa có sản phẩm để mua. Vui lòng quay lại sau.",
+                               "There are no products to buy right now. Please check back later."), UI_GOLD)
     return make_embed(
         pick(lang, "🛍️ Chọn sản phẩm", "🛍️ Choose a Product"),
         (
@@ -4198,7 +4217,8 @@ class ProductSelectView(View):
     def __init__(self, user_id, language, products):
         super().__init__(timeout=120)
         self.user_id = user_id
-        self.add_item(ProductSelect(language, products))
+        if products:
+            self.add_item(ProductSelect(language, products))
 
     async def interaction_check(self, interaction: discord.Interaction):
         return interaction.user.id == self.user_id
@@ -6861,11 +6881,10 @@ class RemoveProductConfirmView(View):
                 self.completed = True
                 self.stop()
                 count = sum(bool(line.strip()) for line in content.splitlines())
-                path_label = f"data/{removed['stock_file']}"
                 embed = make_embed(pick(lang, "⚠️ Xác nhận lần 2: kho vẫn còn nội dung", "⚠️ Second confirmation: stock is not empty"),
                     pick(lang,
-                         f"**{discord.utils.escape_markdown(removed['name'])}**\n\nTệp `{path_label}` vẫn còn nội dung ({count:,} dòng không trống).\n**Xóa sẽ mất vĩnh viễn toàn bộ nội dung tệp kho.**\nBấm xác nhận thêm một lần để xóa cả sản phẩm lẫn tệp. Chọn **Hủy** để giữ nguyên.",
-                         f"**{discord.utils.escape_markdown(removed['name'])}**\n\n`{path_label}` still contains data ({count:,} nonempty lines).\n**Deletion permanently removes all stock file contents.**\nConfirm once more to delete both the product and file, or **Cancel** to keep them."), UI_RED)
+                         f"**{discord.utils.escape_markdown(removed['name'])}**\n\nKho vẫn còn {count:,} account.\n**Xóa sẽ loại bỏ toàn bộ số account này khỏi kho đang bán.**\nBấm xác nhận thêm một lần để xóa sản phẩm và kho. Chọn **Hủy** để giữ nguyên.",
+                         f"**{discord.utils.escape_markdown(removed['name'])}**\n\nStock still contains {count:,} accounts.\n**Deletion removes all of these accounts from sale.**\nConfirm once more to delete the product and stock, or **Cancel** to keep them."), UI_RED)
                 await interaction.edit_original_response(embed=embed, view=next_view)
                 return
             self.completed = True
@@ -6879,7 +6898,7 @@ class RemoveProductConfirmView(View):
                      {"product_id": removed["id"], "name": removed["name"],
                       "stock_file": removed["stock_file"], "stock_file_deleted": True,
                       "extra_confirmation": self.confirmed_stock_digest is not None}, "command")
-        embed = make_embed(pick(lang, "🗑️ Đã xóa sản phẩm và tệp kho", "🗑️ Product and stock file deleted"),
+        embed = make_embed(pick(lang, "🗑️ Đã xóa sản phẩm và kho", "🗑️ Product and stock deleted"),
             f"**{discord.utils.escape_markdown(removed['name'])}**\n`data/{removed['stock_file']}`", UI_GREEN)
         await interaction.edit_original_response(embed=embed, view=None)
         try:
@@ -6908,7 +6927,7 @@ class RemoveProductConfirmView(View):
 
 @tree.command(
     name="removeproduct",
-    description="Admin: remove a product that was added with /addproduct"
+    description="Admin: remove a product, including the original default product"
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -6924,33 +6943,11 @@ async def removeproduct(
 
     query = " ".join(product.split())
 
-    target = None
-    for item in get_extra_products():
-        if item["id"] == query or item["name"].casefold() == query.casefold():
-            target = item
-            break
-
+    target = find_product_by_query(query)
     if target is None:
-        if (
-            query == DEFAULT_PRODUCT_ID
-            or query.casefold() == PRODUCT_NAME.casefold()
-        ):
-            message = pick(
-                lang,
-                f"❌ **{PRODUCT_NAME}** là sản phẩm mặc định của shop nên không thể xóa.",
-                f"❌ **{PRODUCT_NAME}** is the shop's default product and cannot be removed."
-            )
-        else:
-            message = pick(
-                lang,
-                "❌ Không tìm thấy sản phẩm. Hãy chọn từ danh sách gợi ý.",
-                "❌ Product not found. Please pick one from the suggestions."
-            )
-
         await interaction.response.send_message(
-            message,
-            ephemeral=True
-        )
+            pick(lang, "❌ Không tìm thấy sản phẩm. Hãy chọn từ danh sách gợi ý.",
+                 "❌ Product not found. Please pick one from the suggestions."), ephemeral=True)
         return
 
     stock_count = len(load_product_stock(target))
@@ -6962,9 +6959,9 @@ async def removeproduct(
             + pick(
                 lang,
                 "Sản phẩm sẽ biến mất khỏi panel và khách không thể mua nữa. "
-                "Tệp kho cũng sẽ bị xóa. Nếu tệp còn nội dung, bot sẽ yêu cầu xác nhận thêm một lần.",
+                "Kho hàng cũng sẽ bị xóa. Nếu còn account, bot sẽ yêu cầu xác nhận thêm một lần.",
                 "The product will disappear from the panel and can no longer "
-                "be bought. Its stock file will also be deleted; nonempty files require a second confirmation."
+                "be bought. Its stock will also be deleted; nonempty stock requires a second confirmation."
             )
         ),
         UI_GOLD
@@ -7005,7 +7002,7 @@ async def removeproduct_autocomplete(
     current = current.strip().casefold()
 
     choices = []
-    for item in get_extra_products():
+    for item in get_all_products():
         if current and current not in item["name"].casefold() and current not in item["id"]:
             continue
         choices.append(
