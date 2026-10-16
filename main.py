@@ -5356,6 +5356,7 @@ def build_help_embed(language="vi"):
         embed.add_field(
             name="🔐 Administrator Commands",
             value=(
+                "`/addstock <product> <file>` — Upload UTF-8 TXT stock (admin only).\n"
                 "`/addbalance <user> <amount>` — Add VND balance to a user.\n"
                 "`/removebalance <user> <amount>` — Remove VND balance from a user.\n"
                 "`/warranty <order_id>` — Check warranty details for an order as an administrator.\n"
@@ -5407,6 +5408,7 @@ def build_help_embed(language="vi"):
         embed.add_field(
             name="🔐 Lệnh dành cho Administrator",
             value=(
+                "`/addstock <product> <file>` — Chọn sản phẩm và nhập kho từ TXT.\n"
                 "`/addbalance <user> <amount>` — Cộng số dư VND cho người dùng.\n"
                 "`/removebalance <user> <amount>` — Trừ số dư VND của người dùng.\n"
                 "`/warranty <order_id>` — Kiểm tra chi tiết bảo hành đơn hàng với quyền Admin.\n"
@@ -6454,6 +6456,132 @@ async def removetier_tier_autocomplete(
 
 
 # =========================================================
+# /ADDSTOCK
+# =========================================================
+
+MAX_STOCK_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_STOCK_UPLOAD_LINES = 50_000
+
+
+@tree.command(name="addstock", description="Admin: select a product and upload a TXT file to add stock")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    product="Choose the product to replenish",
+    file="UTF-8 .txt file, one account per line (maximum 5 MB)"
+)
+async def addstock(interaction: discord.Interaction, product: str, file: discord.Attachment):
+    lang = get_user_language(interaction.user.id)
+
+    async def fail(vi, en):
+        message = pick(lang, vi, en)
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+    target = find_product_by_query(product)
+    if target is None:
+        await fail("❌ Không tìm thấy sản phẩm. Hãy chọn lại trong danh sách.",
+                   "❌ Product not found. Select a product from the list.")
+        return
+    if not file.filename.lower().endswith(".txt"):
+        await fail("❌ Hãy gửi file có đuôi .txt, mỗi dòng một account.",
+                   "❌ Upload a .txt file with one account per line.")
+        return
+    if file.size > MAX_STOCK_UPLOAD_BYTES:
+        await fail("❌ File quá lớn. Giới hạn là 5 MB.", "❌ File too large. The limit is 5 MB.")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        content = await file.read()
+    except (discord.HTTPException, OSError):
+        await fail("❌ Không tải được file. Kho chưa thay đổi; hãy thử lại.",
+                   "❌ Could not download the file. Stock is unchanged; please retry.")
+        return
+    if len(content) > MAX_STOCK_UPLOAD_BYTES:
+        await fail("❌ File quá lớn. Giới hạn là 5 MB.", "❌ File too large. The limit is 5 MB.")
+        return
+    try:
+        decoded = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        await fail("❌ File không phải UTF-8. Hãy lưu lại bằng UTF-8 rồi gửi lại.",
+                   "❌ The file is not UTF-8. Save it as UTF-8 and upload again.")
+        return
+    if "\x00" in decoded:
+        await fail("❌ File chứa ký tự không hợp lệ. Hãy gửi file văn bản UTF-8.",
+                   "❌ Invalid characters in the file. Upload a UTF-8 text file.")
+        return
+    lines = decoded.splitlines()
+    if len(lines) > MAX_STOCK_UPLOAD_LINES:
+        await fail("❌ Mỗi lần chỉ được nhập tối đa 50.000 dòng.",
+                   "❌ Upload at most 50,000 lines at a time.")
+        return
+    accounts = [line.strip() for line in lines if line.strip()]
+    if not accounts:
+        await fail("❌ File trống hoặc chỉ chứa dòng trắng. Kho chưa thay đổi.",
+                   "❌ The file is empty or contains only blank lines. Stock is unchanged.")
+        return
+
+    # Download outside the lock; reread the product and stock after acquiring it.
+    # Purchases, removals and other uploads share this lock. No await in the commit.
+    async with SHOP_TRANSACTION_LOCK:
+        target = get_product_by_id(target["id"])
+        if target is not None:
+            with data_transaction():
+                stock = load_product_stock(target)
+                seen = set(stock)
+                added = []
+                for account in accounts:
+                    if account not in seen:
+                        seen.add(account)
+                        added.append(account)
+                duplicates = len(accounts) - len(added)
+                if added:
+                    save_product_stock(target, stock + added)
+                    log_activity(interaction.user.id, interaction.user.name, "admin_add_stock", {
+                        "product_id": target["id"], "quantity": len(added),
+                        "duplicates_skipped": duplicates, "stock_before": len(stock),
+                        "stock_after": len(stock) + len(added)
+                    }, "command")
+                total = len(stock) + len(added)
+    if target is None:
+        await fail("❌ Sản phẩm đã bị xóa trong lúc tải file. Kho chưa thay đổi.",
+                   "❌ The product was removed while downloading. Stock is unchanged.")
+        return
+
+    embed = make_embed(
+        pick(lang, "📦 Nhập kho hoàn tất", "📦 Stock Upload Complete"),
+        discord.utils.escape_markdown(target["name"]), UI_GREEN
+    )
+    for name, value in (
+        (pick(lang, "Đã thêm", "Added"), len(added)),
+        (pick(lang, "Bỏ qua dòng trùng", "Duplicate lines skipped"), duplicates),
+        (pick(lang, "Tổng tồn kho", "Total stock"), total)
+    ):
+        embed.add_field(name=name, value=f"{value:,}", inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    if added:
+        try:
+            await update_stock_message()
+        except Exception as exc:
+            # Inventory is already committed; a panel failure must not trigger reimport.
+            print(f"[STOCK] Upload panel refresh error ({type(exc).__name__})")
+
+
+@addstock.autocomplete("product")
+async def addstock_product_autocomplete(interaction: discord.Interaction, current: str):
+    if interaction.guild is None or not interaction.permissions.administrator:
+        return []
+    query = current.strip().casefold()
+    return [app_commands.Choice(name=item["name"][:100], value=item["id"])
+            for item in get_all_products()
+            if not query or query in item["name"].casefold() or query in item["id"].casefold()][:25]
+
+
+# =========================================================
 # /ADDPRODUCT
 # =========================================================
 
@@ -6603,8 +6731,8 @@ async def addproduct(
         value=(
             pick(
                 lang,
-                f"Dừng bot, đặt account trong `input/new_accounts.txt`, rồi chạy:\n`python sqlite_store.py --import-stock input/new_accounts.txt --product {product['id']}`",
-                f"Stop the bot, put accounts in `input/new_accounts.txt`, then run:\n`python sqlite_store.py --import-stock input/new_accounts.txt --product {product['id']}`"
+                f"Dùng `/addstock`, chọn sản phẩm **{product['name']}** và gửi file `.txt` (mỗi dòng một account).",
+                f"Use `/addstock`, select **{product['name']}** and upload a `.txt` file (one account per line)."
             )
         ),
         inline=False

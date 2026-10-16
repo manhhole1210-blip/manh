@@ -68,6 +68,24 @@ phải thực hiện trên máy đang có dữ liệu của bạn.
 
 ## Nhập thêm kho
 
+### Trên Discord, không cần dừng bot
+
+Dùng `/addstock`, chọn `product` trong danh sách sản phẩm (gồm sản phẩm mặc định),
+rồi tải file `.txt` ở tham số `file`. Lệnh chỉ dùng trong server và yêu cầu quyền
+Administrator. Nếu là sản phẩm mới, tạo bằng `/addproduct` trước.
+
+Mỗi dòng là một account; file phải là UTF-8 (có hoặc không BOM), tối đa 5 MB và
+50.000 dòng. Bot bỏ dòng trắng, khoảng trắng đầu/cuối và các dòng trùng với kho
+hiện có hoặc trùng trong chính file. Bot chỉ nối thêm vào sản phẩm đã chọn, không
+thay kho cũ. Kết quả riêng tư báo số đã thêm, số dòng trùng và tổng tồn kho; panel
+shop được cập nhật sau khi lưu thành công. File lỗi không được nhập một phần.
+Nhập kho dùng cùng khóa với mua hàng và xóa sản phẩm, đồng thời commit bằng
+transaction SQLite. Nhật ký chỉ chứa ID sản phẩm và số lượng, không chứa account.
+
+Sau khi cập nhật `main.py`, khởi động lại bot và chờ đồng bộ lệnh để thấy `/addstock`.
+
+### Qua dòng lệnh
+
 Dừng bot. Đặt mỗi account trên một dòng trong `input/new_accounts.txt`, sau đó:
 
 ```bash

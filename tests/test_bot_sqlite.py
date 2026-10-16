@@ -110,6 +110,120 @@ class BotSQLiteTests(unittest.TestCase):
         self.assertEqual(self.bot.ticket_load_json(self.bot.TICKETS_FILE, {})['guild']['ticket']['user_id'], 42)
         self.assertFalse(Path(self.bot.TICKETS_FILE).exists())
 
+    def upload_interaction(self):
+        interaction = self.interaction()
+        interaction.response.is_done = lambda: interaction.response.defer.await_count > 0
+        interaction.guild = SimpleNamespace(id=123)
+        interaction.permissions = SimpleNamespace(administrator=True)
+        return interaction
+
+    def attachment(self, content, filename='accounts.txt'):
+        return SimpleNamespace(filename=filename, size=len(content), read=AsyncMock(return_value=content))
+
+    def test_addstock_default_bom_blank_lines_and_duplicates(self):
+        async def scenario():
+            interaction = self.upload_interaction()
+            file = self.attachment(b'\xef\xbb\xbfaccount3:pass3\r\n\r\n account1:pass1 \naccount3:pass3\naccount4:pass4\n')
+            await self.bot.addstock.callback(interaction, 'default', file)
+            self.assertEqual(self.bot.load_stock(), ['account1:pass1', 'account2:pass2', 'account3:pass3', 'account4:pass4'])
+            embed = interaction.followup.send.call_args.kwargs['embed']
+            self.assertEqual([field.value for field in embed.fields], ['2', '2', '4'])
+            self.assertTrue(interaction.followup.send.call_args.kwargs['ephemeral'])
+            self.bot.update_stock_message.assert_awaited_once()
+            logs = str(self.bot.load_activity_logs())
+            self.assertIn('admin_add_stock', logs)
+            self.assertNotIn('pass3', logs)
+        asyncio.run(scenario())
+
+    def test_addstock_extra_product_and_autocomplete(self):
+        _, product, _ = self.bot.add_or_update_product('Extra product', 2000, 3)
+        async def scenario():
+            interaction = self.upload_interaction()
+            choices = await self.bot.addstock_product_autocomplete(interaction, 'extra')
+            self.assertEqual([choice.value for choice in choices], [product['id']])
+            await self.bot.addstock.callback(interaction, product['id'], self.attachment(b'extra:password\n'))
+            self.assertEqual(self.bot.load_product_stock(product), ['extra:password'])
+            self.assertEqual(len(self.bot.load_stock()), 2)
+            interaction.permissions.administrator = False
+            self.assertEqual(await self.bot.addstock_product_autocomplete(interaction, ''), [])
+            self.assertTrue(self.bot.addstock.guild_only)
+            with self.assertRaises(self.bot.app_commands.MissingPermissions):
+                for check in self.bot.addstock.checks:
+                    await check(interaction)
+        asyncio.run(scenario())
+
+    def test_addstock_rejects_bad_files_without_changing_stock(self):
+        async def scenario():
+            cases = [
+                self.attachment(b'abc', 'accounts.csv'),
+                self.attachment(b'\xff\xfe'),
+                self.attachment(b'a\0b'),
+                self.attachment(b' \n\t'),
+                self.attachment(b'a\n' * (self.bot.MAX_STOCK_UPLOAD_LINES + 1)),
+            ]
+            oversized = self.attachment(b'a')
+            oversized.size = self.bot.MAX_STOCK_UPLOAD_BYTES + 1
+            cases.append(oversized)
+            mismatch = self.attachment(b'a' * (self.bot.MAX_STOCK_UPLOAD_BYTES + 1))
+            mismatch.size = 1
+            cases.append(mismatch)
+            for file in cases:
+                with self.subTest(filename=file.filename, size=file.size):
+                    interaction = self.upload_interaction()
+                    await self.bot.addstock.callback(interaction, 'default', file)
+                    self.assertEqual(len(self.bot.load_stock()), 2)
+                    messages = interaction.response.send_message.call_args_list + interaction.followup.send.call_args_list
+                    self.assertTrue(messages)
+                    self.assertTrue(all(message.kwargs['ephemeral'] for message in messages))
+            unknown = self.attachment(b'a')
+            await self.bot.addstock.callback(self.upload_interaction(), 'missing', unknown)
+            unknown.read.assert_not_awaited()
+        asyncio.run(scenario())
+
+    def test_addstock_concurrent_uploads_do_not_duplicate_accounts(self):
+        async def scenario():
+            async def download():
+                await asyncio.sleep(0)
+                return b'new:account\n'
+            files = [self.attachment(b'new:account\n') for _ in range(2)]
+            for file in files:
+                file.read.side_effect = download
+            interactions = [self.upload_interaction(), self.upload_interaction()]
+            await asyncio.gather(*(self.bot.addstock.callback(interaction, 'default', file)
+                                   for interaction, file in zip(interactions, files)))
+            self.assertEqual(self.bot.load_stock(), ['account1:pass1', 'account2:pass2', 'new:account'])
+            counts = [interaction.followup.send.call_args.kwargs['embed'].fields[0].value for interaction in interactions]
+            self.assertEqual(sorted(counts), ['0', '1'])
+        asyncio.run(scenario())
+
+    def test_addstock_detects_product_removed_during_download(self):
+        _, product, _ = self.bot.add_or_update_product('Removed product', 2000, 3)
+        async def scenario():
+            async def download():
+                self.bot.remove_product(product['id'])
+                return b'new:account\n'
+            file = self.attachment(b'new:account\n')
+            file.read.side_effect = download
+            interaction = self.upload_interaction()
+            await self.bot.addstock.callback(interaction, product['id'], file)
+            self.assertIsNone(self.bot.get_product_by_id(product['id']))
+            self.assertEqual(self.bot.load_product_stock(product), [])
+            self.assertIn('❌', interaction.followup.send.call_args.args[0])
+        asyncio.run(scenario())
+
+    def test_addstock_storage_failure_rolls_back(self):
+        original = self.bot.save_product_stock
+        def fail(product, stock):
+            original(product, stock)
+            raise OSError('injected stock write failure')
+        self.bot.save_product_stock = fail
+        async def scenario():
+            with self.assertRaises(OSError):
+                await self.bot.addstock.callback(self.upload_interaction(), 'default', self.attachment(b'new:account\n'))
+            self.assertEqual(self.bot.load_stock(), ['account1:pass1', 'account2:pass2'])
+            self.bot.update_stock_message.assert_not_awaited()
+        asyncio.run(scenario())
+
 
 if __name__ == '__main__':
     unittest.main()
