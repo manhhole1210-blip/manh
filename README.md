@@ -74,8 +74,8 @@ Dùng `/addstock`, chọn `product` trong danh sách sản phẩm (gồm sản p
 rồi tải file `.txt` ở tham số `file`. Lệnh chỉ dùng trong server và yêu cầu quyền
 Administrator. Nếu là sản phẩm mới, tạo bằng `/addproduct` trước.
 
-Mỗi dòng là một account; file phải là UTF-8 (có hoặc không BOM), tối đa 5 MB và
-50.000 dòng. Bot bỏ dòng trắng, khoảng trắng đầu/cuối và các dòng trùng với kho
+Mỗi dòng là một account; file phải là UTF-8 (có hoặc không BOM), tối đa
+50.000 dòng. Bot không đặt giới hạn MB riêng; dung lượng tải lên theo giới hạn Discord. Bot bỏ dòng trắng, khoảng trắng đầu/cuối và các dòng trùng với kho
 hiện có hoặc trùng trong chính file. Bot chỉ nối thêm vào sản phẩm đã chọn, không
 thay kho cũ. Kết quả riêng tư báo số đã thêm, số dòng trùng và tổng tồn kho; panel
 shop được cập nhật sau khi lưu thành công. File lỗi không được nhập một phần.

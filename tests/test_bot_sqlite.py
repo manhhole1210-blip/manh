@@ -161,12 +161,6 @@ class BotSQLiteTests(unittest.TestCase):
                 self.attachment(b' \n\t'),
                 self.attachment(b'a\n' * (self.bot.MAX_STOCK_UPLOAD_LINES + 1)),
             ]
-            oversized = self.attachment(b'a')
-            oversized.size = self.bot.MAX_STOCK_UPLOAD_BYTES + 1
-            cases.append(oversized)
-            mismatch = self.attachment(b'a' * (self.bot.MAX_STOCK_UPLOAD_BYTES + 1))
-            mismatch.size = 1
-            cases.append(mismatch)
             for file in cases:
                 with self.subTest(filename=file.filename, size=file.size):
                     interaction = self.upload_interaction()
@@ -178,6 +172,18 @@ class BotSQLiteTests(unittest.TestCase):
             unknown = self.attachment(b'a')
             await self.bot.addstock.callback(self.upload_interaction(), 'missing', unknown)
             unknown.read.assert_not_awaited()
+        asyncio.run(scenario())
+
+    def test_addstock_accepts_file_larger_than_former_5mb_limit(self):
+        async def scenario():
+            content = b'a' * (5 * 1024 * 1024 + 1)
+            file = self.attachment(content)
+            interaction = self.upload_interaction()
+            await self.bot.addstock.callback(interaction, 'default', file)
+            stock = self.bot.load_stock()
+            self.assertEqual(len(stock), 3)
+            self.assertEqual(stock[-1].encode('utf-8'), content)
+            self.assertEqual(interaction.followup.send.call_args.kwargs['embed'].fields[0].value, '1')
         asyncio.run(scenario())
 
     def test_addstock_concurrent_uploads_do_not_duplicate_accounts(self):

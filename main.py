@@ -6459,7 +6459,6 @@ async def removetier_tier_autocomplete(
 # /ADDSTOCK
 # =========================================================
 
-MAX_STOCK_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_STOCK_UPLOAD_LINES = 50_000
 
 
@@ -6469,7 +6468,7 @@ MAX_STOCK_UPLOAD_LINES = 50_000
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     product="Choose the product to replenish",
-    file="UTF-8 .txt file, one account per line (maximum 5 MB)"
+    file="UTF-8 .txt file, one account per line"
 )
 async def addstock(interaction: discord.Interaction, product: str, file: discord.Attachment):
     lang = get_user_language(interaction.user.id)
@@ -6490,9 +6489,6 @@ async def addstock(interaction: discord.Interaction, product: str, file: discord
         await fail("❌ Hãy gửi file có đuôi .txt, mỗi dòng một account.",
                    "❌ Upload a .txt file with one account per line.")
         return
-    if file.size > MAX_STOCK_UPLOAD_BYTES:
-        await fail("❌ File quá lớn. Giới hạn là 5 MB.", "❌ File too large. The limit is 5 MB.")
-        return
 
     await interaction.response.defer(ephemeral=True)
     try:
@@ -6500,9 +6496,6 @@ async def addstock(interaction: discord.Interaction, product: str, file: discord
     except (discord.HTTPException, OSError):
         await fail("❌ Không tải được file. Kho chưa thay đổi; hãy thử lại.",
                    "❌ Could not download the file. Stock is unchanged; please retry.")
-        return
-    if len(content) > MAX_STOCK_UPLOAD_BYTES:
-        await fail("❌ File quá lớn. Giới hạn là 5 MB.", "❌ File too large. The limit is 5 MB.")
         return
     try:
         decoded = content.decode("utf-8-sig")
