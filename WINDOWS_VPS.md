@@ -39,6 +39,26 @@ số), không in username/token và không sửa dữ liệu. Đối chiếu l�
 users.json bằng `{}`. Bot đã nhập dữ liệu vào SQLite thì sửa JSON cũ không thay đổi
 số dư hiện tại.
 
+### Điều chỉnh số dư lẻ khi chủ bot đã chấp thuận
+
+Dừng bot/task. Lệnh `round-balances` yêu cầu khai báo rõ từng Discord ID và số dư cũ
+đã được chấp thuận; không tự quét rồi làm tròn mọi người dùng. Ví dụ minh họa với ID
+và số tiền giả (thay bằng kế hoạch thực đã được duyệt):
+
+```bat
+.venv\Scripts\python.exe manage_bot.py round-balances --expect "123=10.8,456=0.16" --confirm
+```
+
+Quy tắc ROUND_HALF_UP: 10.8 thành 11, 0.16 thành 0. Công cụ giữ khóa chống bot đang
+chạy, kiểm tra số dư hiện tại khớp số dư khai báo, tạo backup đã kiểm tra integrity tại
+`backups/pre-round-vnd-...db`, rồi cập nhật toàn bộ số dư và audit trong một transaction.
+Nếu một số dư đã thay đổi hoặc audit không ghi được, không áp dụng một phần. Chạy lại
+cùng kế hoạch đã hoàn tất không điều chỉnh lần nữa. Audit lưu số dư trước/sau, chênh
+lệch, quy tắc và đường dẫn backup; không sửa đơn hàng hoặc lịch sử giao dịch gốc.
+
+Sau khi hoàn tất, chạy `manage_bot.py check-money`; nếu hết lỗi mới khởi động bot.
+Không dùng lệnh này thay việc đối chiếu số dư âm, sai định dạng hoặc tiền vượt giới hạn.
+
 ## Cấu hình quyền và cảnh báo
 
 Bật Developer Mode trong Discord, nhấp phải server/người dùng/kênh để Copy ID.

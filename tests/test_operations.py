@@ -104,6 +104,64 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(self.store.load_json(path, {}), original)
         self.assertIsNone(self.store.db.execute("SELECT 1 FROM metadata WHERE key='integer_vnd_v1'").fetchone())
 
+    def test_approved_rounding_has_backup_audit_and_no_double_application(self):
+        from operations import parse_rounding_plan, round_approved_balances
+        path = self.root / 'data/users.json'
+        before = {'42': {'balance': 10.8, 'username': 'keep-name', 'language': 'en'},
+                  '43': {'balance': 0.16}, '44': {'balance': 33.5}, '99': {'balance': 100}}
+        self.store.save_json(path, before)
+        plan = parse_rounding_plan('42=10.8,43=0.16,44=33.5')
+        result = round_approved_balances(self.root, plan)
+        self.assertFalse(result['already_applied'])
+        after = self.store.load_json(path, {})
+        self.assertEqual([after[uid]['balance'] for uid in ('42','43','44')], [11,0,34])
+        self.assertEqual(after['42']['username'], 'keep-name')
+        self.assertEqual(after['42']['language'], 'en')
+        self.assertEqual(after['99'], before['99'])
+        saved = readonly_database(self.root / result['backup'])
+        try:
+            self.assertEqual(json.loads(saved.execute("SELECT payload FROM users WHERE id='42'").fetchone()[0])['balance'], 10.8)
+        finally:
+            saved.close()
+        logs = self.store.load_json(self.root / 'data/activity_logs.json', {})
+        self.assertEqual(logs['42'][-1]['action'], 'balance_rounding_adjustment')
+        self.assertEqual(logs['43'][-1]['details']['delta_vnd'], '-0.16')
+        repeated = round_approved_balances(self.root, plan)
+        self.assertTrue(repeated['already_applied'])
+        self.assertEqual(self.store.load_json(path, {}), after)
+        self.assertEqual(len(self.store.load_json(self.root / 'data/activity_logs.json', {})['42']), 1)
+        self.store.upgrade_vnd()
+
+    def test_rounding_refuses_changed_balances_missing_users_and_running_bot(self):
+        from operations import parse_rounding_plan, round_approved_balances
+        path = self.root / 'data/users.json'
+        before = {'42': {'balance': 10.8}, '43': {'balance': 0.16}}
+        self.store.save_json(path, before)
+        for text in ('42=10.5,43=0.16', '42=10.8,44=0.16'):
+            with self.assertRaises(ValueError):
+                round_approved_balances(self.root, parse_rounding_plan(text))
+            self.assertEqual(self.store.load_json(path, {}), before)
+        lock = acquire_process_lock(self.root / 'data')
+        try:
+            with self.assertRaises(OSError):
+                round_approved_balances(self.root, parse_rounding_plan('42=10.8,43=0.16'))
+        finally:
+            lock.close()
+        self.assertEqual(list((self.root / 'backups').glob('pre-round-vnd-*.db')), [])
+
+    def test_rounding_rolls_back_all_wallets_when_audit_write_fails(self):
+        from operations import parse_rounding_plan, round_approved_balances
+        path = self.root / 'data/users.json'
+        before = {'42': {'balance': 10.8}, '43': {'balance': 0.16}}
+        self.store.save_json(path, before)
+        self.store.save_json(self.root / 'data/activity_logs.json', {'43': 'broken bucket'})
+        with self.assertRaisesRegex(ValueError, 'Invalid audit history'):
+            round_approved_balances(self.root, parse_rounding_plan('42=10.8,43=0.16'))
+        self.assertEqual(self.store.load_json(path, {}), before)
+        self.assertEqual(self.store.load_json(self.root / 'data/activity_logs.json', {}), {'43': 'broken bucket'})
+        self.assertIsNone(self.store.db.execute("SELECT 1 FROM metadata WHERE key LIKE 'approved_balance_rounding:%'").fetchone())
+        self.assertEqual(len(list((self.root / 'backups').glob('pre-round-vnd-*.db'))), 1)
+
     def test_policy_requires_guild_id_admin_id_and_permission(self):
         policy = RuntimePolicy(self.root)
         policy.config.update(allowed_guild_ids=[123], admin_user_ids=[42])

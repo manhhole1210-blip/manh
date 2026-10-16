@@ -182,3 +182,108 @@ def restore_database(root, backup):
     finally:
         staging.unlink(missing_ok=True)
         lock.close()
+
+
+def parse_rounding_plan(text):
+    """Require explicit ID=old-balance pairs; never round every wallet implicitly."""
+    from decimal import Decimal, InvalidOperation
+    from money import MAX_VND
+    plan = {}
+    for entry in text.split(','):
+        user_id, separator, raw = entry.strip().partition('=')
+        if not separator or not user_id.isdigit() or len(user_id) > 22 or user_id in plan:
+            raise ValueError('Use unique Discord_ID=approved_old_balance pairs separated by commas')
+        if len(raw) > 100:
+            raise ValueError('Invalid approved balance')
+        try:
+            amount = Decimal(raw)
+        except InvalidOperation:
+            raise ValueError('Invalid approved balance') from None
+        if not amount.is_finite() or amount < 0 or amount > MAX_VND or amount == amount.to_integral_value():
+            raise ValueError('Each approved old balance must be finite, nonnegative and fractional')
+        plan[user_id] = amount
+    if not plan:
+        raise ValueError('Rounding plan is empty')
+    return plan
+
+
+def round_approved_balances(root, plan):
+    """Offline, backup-first, exact-match, atomic wallet rounding with durable audit."""
+    from decimal import Decimal, ROUND_HALF_UP
+    import hashlib
+    from money import vnd
+    from sqlite_store import acquire_process_lock
+    root = Path(root).resolve()
+    database = root / 'data/bot.db'
+    # Validate programmatic callers as strictly as CLI input.
+    plan = parse_rounding_plan(','.join(f'{uid}={value}' for uid, value in sorted(plan.items())))
+    changes = [dict(user_id=uid, old=str(amount), new=vnd(amount.quantize(Decimal('1'), rounding=ROUND_HALF_UP)),
+                    delta=str(amount.quantize(Decimal('1'), rounding=ROUND_HALF_UP) - amount))
+               for uid, amount in sorted(plan.items())]
+    key = 'approved_balance_rounding:' + hashlib.sha256(json.dumps(changes, sort_keys=True).encode()).hexdigest()
+    lock = acquire_process_lock(root / 'data')
+    connection = None
+    try:
+        def validate_wallets(db):
+            for item in changes:
+                row = db.execute('SELECT payload FROM users WHERE id=?', (item['user_id'],)).fetchone()
+                if row is None:
+                    raise ValueError(f"User {item['user_id']} does not exist; no balances changed")
+                user = json.loads(row[0])
+                balance = user.get('balance') if isinstance(user, dict) else None
+                try:
+                    matches = not isinstance(balance, bool) and Decimal(str(balance)) == plan[item['user_id']]
+                except Exception:
+                    matches = False
+                if not matches:
+                    raise ValueError(f"Balance changed for user {item['user_id']}; expected plan no longer matches. No balances changed")
+        source = readonly_database(database)
+        try:
+            validate_database(source)
+            previous = source.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
+            if previous:
+                return {**json.loads(previous[0]), 'already_applied': True}
+            validate_wallets(source)
+        finally:
+            source.close()
+        backup = snapshot_database(database, root / 'backups' / f'pre-round-vnd-{utc_stamp()}.db')
+        connection = sqlite3.connect(database.as_uri() + '?mode=rw', uri=True, isolation_level=None, timeout=30)
+        connection.execute('PRAGMA synchronous=FULL')
+        connection.execute('BEGIN IMMEDIATE')
+        validate_wallets(connection)  # Catch external changes between preflight and the write lock.
+        marker = connection.execute("SELECT 1 FROM documents WHERE path='data/users.json'").fetchone()
+        if marker is None:
+            raise ValueError('Missing users collection marker; no balances changed')
+        row = connection.execute("SELECT payload FROM documents WHERE path='data/activity_logs.json'").fetchone()
+        logs = json.loads(row[0]) if row else {}
+        if not isinstance(logs, dict):
+            raise ValueError('Invalid audit history structure; no balances changed')
+        created_at = datetime.now(timezone.utc).isoformat()
+        manifest = {'created_at': created_at, 'rule': 'ROUND_HALF_UP', 'actor': 'owner-approved-local-cli',
+                    'backup': str(backup.relative_to(root)), 'changes': changes}
+        for item in changes:
+            user_id = item['user_id']
+            user = json.loads(connection.execute('SELECT payload FROM users WHERE id=?', (user_id,)).fetchone()[0])
+            user['balance'] = item['new']
+            connection.execute('UPDATE users SET payload=? WHERE id=?',
+                               (json.dumps(user, ensure_ascii=False, allow_nan=False), user_id))
+            bucket = logs.setdefault(user_id, [])
+            if not isinstance(bucket, list):
+                raise ValueError(f'Invalid audit history for {user_id}; no balances changed')
+            bucket.append({'timestamp': created_at, 'user_id': int(user_id), 'username': str(user.get('username', '')),
+                'action': 'balance_rounding_adjustment', 'interaction_type': 'local_cli',
+                'details': {'balance_before': item['old'], 'balance_after': item['new'], 'delta_vnd': item['delta'],
+                            'rounding_rule': 'ROUND_HALF_UP', 'approval_id': key, 'backup': manifest['backup']}})
+        connection.execute('INSERT INTO documents VALUES (?,?) ON CONFLICT(path) DO UPDATE SET payload=excluded.payload',
+                           ('data/activity_logs.json', json.dumps(logs, ensure_ascii=False, allow_nan=False)))
+        connection.execute('INSERT INTO metadata VALUES (?,?)', (key, json.dumps(manifest, allow_nan=False)))
+        connection.execute('COMMIT')
+        return {**manifest, 'already_applied': False}
+    except BaseException:
+        if connection is not None and connection.in_transaction:
+            connection.execute('ROLLBACK')
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+        lock.close()

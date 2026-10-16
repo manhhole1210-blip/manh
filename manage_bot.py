@@ -61,6 +61,9 @@ def main():
     init.add_argument('--alert-channel-id', default='0')
     sub.add_parser('backup')
     sub.add_parser('check-money', help='Read-only diagnostic of live SQLite user balances')
+    rounding = sub.add_parser('round-balances', help='Offline rounding of an explicitly approved wallet plan')
+    rounding.add_argument('--expect', required=True, help='Comma-separated Discord_ID=approved_old_balance pairs')
+    rounding.add_argument('--confirm', action='store_true', required=True)
     resume = sub.add_parser('resume-payments')
     resume.add_argument('--confirm-reconciled', action='store_true', required=True)
     restore = sub.add_parser('restore')
@@ -72,6 +75,18 @@ def main():
             print(f'ERROR user_id={user_id}: {reason}' + (f'; balance={amount}' if amount is not None else ''))
         print(f'Checked {checked} users; {len(issues)} issues. No balances or files were changed.')
         raise SystemExit(1 if issues else 0)
+    elif args.command == 'round-balances':
+        from operations import parse_rounding_plan, round_approved_balances
+        try:
+            result = round_approved_balances(args.root, parse_rounding_plan(args.expect))
+        except (ValueError, OSError) as exc:
+            parser.exit(1, f'ERROR: {exc}\n')
+        if result['already_applied']:
+            print('This exact adjustment was already applied. No balances changed.')
+        else:
+            for item in result['changes']:
+                print(f"UPDATED user_id={item['user_id']}: {item['old']} -> {item['new']} VND")
+            print(f"Adjusted {len(result['changes'])} users. Backup: {result['backup']}. Audit recorded.")
     elif args.command == 'configure':
         from sqlite_store import acquire_process_lock
         lock = acquire_process_lock(args.root / 'data')
