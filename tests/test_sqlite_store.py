@@ -21,6 +21,26 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_short_topup_codes_are_unique_and_survive_restart(self):
+        codes = {self.store.get_topup_code(uid) for uid in range(1, 101)}
+        self.assertEqual(len(codes), 100)
+        code = self.store.get_topup_code(42)
+        self.assertRegex(code, r'^LC[A-Z][A-Z2-9]{5}$')
+        self.store.close()
+        self.store = SQLiteStore(self.root)
+        self.assertEqual(self.store.get_topup_code(42), code)
+        self.assertEqual(self.store.topup_code_user(code.lower()), '42')
+        self.assertIsNone(self.store.topup_code_user('LCUNKNOWN'))
+
+    def test_short_topup_code_retries_collision(self):
+        with patch('sqlite_store.secrets.choice', return_value='A'):
+            code = self.store.get_topup_code(1)
+        with patch('sqlite_store.secrets.choice', side_effect=['A'] * 6 + ['B'] * 6):
+            other = self.store.get_topup_code(2)
+        self.assertNotEqual(code, other)
+        self.assertEqual(self.store.topup_code_user(code), '1')
+        self.assertEqual(self.store.topup_code_user(other), '2')
+
     def test_migration_exact_backup_and_no_reimport(self):
         data = self.root / 'data'
         users = data / 'users.json'

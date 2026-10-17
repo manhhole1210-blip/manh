@@ -74,6 +74,20 @@ class RuntimeBotTests(unittest.TestCase):
             self.assertEqual(self.bot.STORE.delivery('LC-OLD')['status'], 'sent')
         asyncio.run(scenario())
 
+    def test_short_code_credits_after_username_change_exactly_once(self):
+        code = self.bot.STORE.get_topup_code(42)
+        self.bot.users['42']['username'] = 'renamed-customer'
+        self.bot.fetch_vcb_history = lambda: {'transactions': [{
+            'transactionId': 'short-code-payment', 'creditAmount': 5000,
+            'description': 'NAP ' + code.lower()}]}
+        async def scenario():
+            await self.bot.process_bank_transactions()
+            await self.bot.process_bank_transactions()
+        asyncio.run(scenario())
+        self.assertEqual(self.bot.get_user_balance(42), 15000)
+        self.assertEqual(self.bot.STORE.bank_payment('short-code-payment')['status'], 'credited')
+        self.assertEqual(len(self.bot.load_topup_history()), 1)
+
     def test_pending_bank_transfer_manual_reconciliation_is_idempotent(self):
         self.bot.notify_admins = AsyncMock()
         self.bot.fetch_vcb_history = lambda: {'transactions': [{'transactionId': 'pending-1', 'creditAmount': 5000, 'description': 'LCunknown'}]}

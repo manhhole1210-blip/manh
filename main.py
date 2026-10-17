@@ -1948,14 +1948,17 @@ async def process_bank_transactions():
             stable_id = first_value(item, ['transactionId','transId','tranId','reference','referenceNo',
                 'referenceId','refNo','transactionCode','trace','traceId','tid','ftid','id'])
             matches = []
-            if code:
+            short_code_user = STORE.topup_code_user("LC" + code) if code else None
+            if short_code_user:
+                matches = [short_code_user] if short_code_user in users else []
+            elif code:
                 if code.isdigit():
                     matches = [code] if code in users else []
                 else:
                     matches = [uid for uid, user in users.items() if str(user.get('username','')).casefold() == code.casefold()]
             reason = ('restore_paused' if STORE.payments_paused() else 'no_stable_id' if stable_id is None or not str(stable_id).strip() else
                       'no_code' if not code else 'user_not_found' if not matches else
-                      'ambiguous_user' if len(matches) != 1 else 'legacy_username' if not code.isdigit() else 'matched')
+                      'ambiguous_user' if len(matches) != 1 else 'legacy_username' if not short_code_user and not code.isdigit() else 'matched')
             async with SHOP_TRANSACTION_LOCK:
                 old = STORE.bank_payment(transaction_id)
                 if old is not None:
@@ -4857,7 +4860,7 @@ class TopupModal(Modal):
             return
 
         content = (
-            f"LC{interaction.user.id}"
+            STORE.get_topup_code(interaction.user.id)
         )
 
         qr_url = (

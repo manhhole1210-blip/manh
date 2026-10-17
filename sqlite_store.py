@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import secrets
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +67,8 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS documents (path TEXT PRIMARY KEY, payload TEXT NOT NULL CHECK(json_valid(payload)));
             CREATE TABLE IF NOT EXISTS processed_transactions (transaction_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS payment_claims (provider TEXT, payment_id TEXT, PRIMARY KEY(provider,payment_id));
+            CREATE TABLE IF NOT EXISTS topup_codes (
+                user_id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS bank_payments (
                 transaction_id TEXT PRIMARY KEY, amount_vnd INTEGER NOT NULL CHECK(amount_vnd>0),
                 description TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
@@ -78,6 +81,31 @@ class SQLiteStore:
         ''')
         for table in self.ENTITY_TABLES.values():
             self.db.execute(f'CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, payload TEXT NOT NULL CHECK(json_valid(payload)))')
+
+    def get_topup_code(self, user_id):
+        """Return a permanent, unique bank memo, including its LC prefix."""
+        user_id = str(user_id)
+        if not user_id.isdigit() or int(user_id) <= 0:
+            raise ValueError('Invalid Discord user ID')
+        for _ in range(100):
+            row = self.db.execute('SELECT code FROM topup_codes WHERE user_id=?', (user_id,)).fetchone()
+            if row:
+                return row[0]
+            # Leading letter keeps short codes distinct from legacy numeric IDs.
+            code = 'LC' + secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ') + ''.join(
+                secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(5))
+            if self.db.execute("SELECT 1 FROM users WHERE lower(json_extract(payload, '$.username'))=lower(?)", (code[2:],)).fetchone():
+                continue
+            try:
+                self.db.execute('INSERT INTO topup_codes(user_id,code) VALUES (?,?)', (user_id, code))
+                return code
+            except sqlite3.IntegrityError:
+                continue  # Another connection issued this user/code; re-read or retry.
+        raise RuntimeError('Unable to allocate a unique top-up code')
+
+    def topup_code_user(self, code):
+        row = self.db.execute('SELECT user_id FROM topup_codes WHERE code=?', (str(code),)).fetchone()
+        return row[0] if row else None
 
     def key(self, path):
         return Path(path).resolve().relative_to(self.root).as_posix()
