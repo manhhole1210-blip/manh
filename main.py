@@ -6727,6 +6727,33 @@ class PreorderProductSelect(discord.ui.Select):
         await interaction.response.send_modal(PreorderQuantityModal(self.values[0], self.lang))
 
 
+def build_preorder_invoice(row, lang='vi'):
+    status = {
+        'waiting': pick(lang, '⏳ Đã thanh toán • Chờ hàng', '⏳ Paid • Awaiting stock'),
+        'fulfilled': pick(lang, '📦 Đã phân hàng', '📦 Stock allocated'),
+        'cancelled': pick(lang, '↩️ Đã hủy và hoàn tiền', '↩️ Cancelled & refunded'),
+    }[row['status']]
+    embed = make_embed(pick(lang, '🧾 Hóa đơn đặt trước', '🧾 Preorder Receipt'),
+        pick(lang, 'Thanh toán từ số dư Lemon Service.', 'Paid from your Lemon Service balance.'), UI_GREEN)
+    for name, value in (
+        (pick(lang, 'Mã đơn', 'Preorder ID'), f"`{row['id']}`"),
+        (pick(lang, 'Khách hàng', 'Customer'), f"<@{row['user_id']}>"),
+        (pick(lang, 'Sản phẩm', 'Product'), discord.utils.escape_markdown(row['product_name'])[:1024]),
+        (pick(lang, 'Số lượng', 'Quantity'), f"{row['quantity']:,}"),
+        (pick(lang, 'Đơn giá', 'Unit price'), f"{row['unit_price']:,} VND"),
+        (pick(lang, 'Tổng đã thanh toán', 'Total paid'), f"{row['total']:,} VND"),
+        (pick(lang, 'Thời gian đặt', 'Placed at'), row['created_at'].replace('T', ' ')[:19]),
+        (pick(lang, 'Trạng thái', 'Status'), status),
+    ):
+        embed.add_field(name=name, value=value, inline=False)
+    embed.add_field(name=pick(lang, 'Giao hàng & bảo hành', 'Delivery & warranty'), value=pick(lang,
+        f"Tự giao qua DM khi đủ hàng, theo thứ tự đặt trước. Bảo hành: {row['warranty_days']} ngày tính từ lúc phân hàng. "
+        "Chưa có cam kết ngày giao. Xem /mypreorders. Khách không thể tự hủy; liên hệ admin nếu cần hỗ trợ.",
+        f"Automatic FIFO delivery via DM when stock is sufficient. Warranty: {row['warranty_days']} days from allocation. "
+        "No guaranteed delivery date. See /mypreorders. Customers cannot cancel; contact an admin for help."), inline=False)
+    return embed
+
+
 class ConfirmPreorderView(View):
     def __init__(self, user_id, product, quantity, price, lang):
         super().__init__(timeout=180)
@@ -6751,12 +6778,17 @@ class ConfirmPreorderView(View):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
         lang = get_user_language(interaction.user.id)
-        await interaction.edit_original_response(content=pick(lang,
-            f"✅ Đơn đặt trước `{row['id']}` • {row['quantity']:,} account • Đã thanh toán {row['total']:,} VND.\n"
-            "Bot tự giao khi đủ hàng theo thứ tự đặt trước. Dùng /mypreorders để xem. Khách không thể tự hủy; liên hệ admin nếu cần hỗ trợ.",
-            f"✅ Preorder `{row['id']}` • {row['quantity']:,} accounts • Paid {row['total']:,} VND.\n"
-            "Automatic FIFO delivery when stock is sufficient. /mypreorders to view. Customers cannot cancel; contact an admin for help."), embed=None, view=None)
+        invoice = build_preorder_invoice(row, lang)
+        await interaction.edit_original_response(content=None, embed=invoice, view=None)
         self.stop()
+        if created:
+            try:
+                await interaction.user.send(embed=invoice)
+            except (discord.HTTPException, OSError):
+                logging.warning('[PREORDER] Receipt DM failed; payment remains recorded')
+                await interaction.followup.send(pick(lang,
+                    f"⚠️ Không gửi được hóa đơn vào DM. Đơn `{row['id']}` vẫn đã được lưu và thanh toán; hóa đơn ở trên. Dùng /mypreorders để xem lại.",
+                    f"⚠️ Could not DM your receipt. Preorder `{row['id']}` is saved and paid; your receipt is above. Use /mypreorders to view it."), ephemeral=True)
         await process_preorders()
 
 

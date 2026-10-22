@@ -246,3 +246,38 @@ class PreorderTests(unittest.TestCase):
         asyncio.run(self.bot.cancelpreorder.callback(interaction, row['id']))
         self.assertEqual(self.bot.STORE.preorder(row['id'])['status'], 'waiting')
         self.assertEqual(self.bot.get_user_balance(42), balance)
+
+    def test_preorder_receipt_is_sent_once_and_shown_privately(self):
+        self.bot.save_stock([])
+        async def scenario():
+            product = self.bot.get_default_product()
+            view = self.bot.ConfirmPreorderView(42, product, 2, self.bot.product_price(product, 2), 'vi')
+            interaction = self.interaction()
+            await view.children[0].callback(interaction)
+            await view.children[0].callback(self.interaction())
+            self.user.send.assert_awaited_once()
+            receipt = self.user.send.call_args.kwargs['embed']
+            fields = {f.name: f.value for f in receipt.fields}
+            self.assertIn(view.preorder_id, fields['Mã đơn'])
+            self.assertEqual(fields['Số lượng'], '2')
+            row = self.bot.STORE.preorder(view.preorder_id)
+            self.assertEqual(fields['Tổng đã thanh toán'], f"{row['total']:,} VND")
+            self.assertIn('Chờ hàng', fields['Trạng thái'])
+            self.assertIs(interaction.edit_original_response.call_args.kwargs['embed'], receipt)
+            self.assertEqual(self.bot.get_user_balance(42), 10000-row['total'])
+        asyncio.run(scenario())
+
+    def test_receipt_dm_failure_keeps_paid_preorder_and_reports_fallback(self):
+        self.bot.save_stock([])
+        self.user.send.side_effect = OSError('DM blocked')
+        async def scenario():
+            product = self.bot.get_default_product()
+            view = self.bot.ConfirmPreorderView(42, product, 2, self.bot.product_price(product, 2), 'vi')
+            interaction = self.interaction()
+            await view.children[0].callback(interaction)
+            row = self.bot.STORE.preorder(view.preorder_id)
+            self.assertEqual(row['status'], 'waiting')
+            self.assertEqual(self.bot.get_user_balance(42), 10000-row['total'])
+            self.assertIn(view.preorder_id, interaction.followup.send.call_args.args[0])
+            self.assertTrue(interaction.followup.send.call_args.kwargs['ephemeral'])
+        asyncio.run(scenario())

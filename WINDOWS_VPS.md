@@ -258,3 +258,8 @@ Kiểm tra trên VPS bằng một đơn nhỏ: đặt lúc kho trống, xác nh�
 nhập kho, kiểm tra nhận đúng hàng và không bị trừ lần nữa. Dùng tài khoản admin hủy một đơn khác
 trước nhập kho để xác nhận hoàn đủ tiền một lần. Nếu chưa thấy nút mới, chờ panel
 cập nhật; slash `/preorder` luôn là cách truy cập trực tiếp trong server được phép.
+
+Sau khi thanh toán đặt trước, khách nhận hóa đơn embed riêng ngay tại nơi xác nhận
+và một bản qua DM (mỗi đơn mới gửi một lần). Hóa đơn gồm mã PRE, khách hàng, sản phẩm,
+số lượng, đơn giá, tổng tiền, thời gian đặt và trạng thái. Nếu DM bị chặn, bot báo
+ngay tại phản hồi riêng; đơn và tiền đã trả vẫn được lưu, không trừ hoặc hoàn lại tự động.
