@@ -206,3 +206,43 @@ class PreorderTests(unittest.TestCase):
             self.assertTrue(response['ephemeral'])
             self.assertEqual(self.bot.get_user_balance(42), 10000)
         asyncio.run(scenario())
+
+    def test_customers_cannot_cancel_through_either_command(self):
+        row, _ = self.book()
+        balance = self.bot.get_user_balance(42)
+        self.bot.POLICY.config['admin_user_ids'] = [99]
+        async def scenario():
+            for command in (self.bot.cancelpreorder, self.bot.cancelcustomerpreorder):
+                interaction = self.interaction()
+                with self.assertRaises(self.bot.app_commands.CheckFailure):
+                    for check in command.checks:
+                        await check(interaction)
+                await command.callback(interaction, row['id'])
+                self.assertIn('Only admins', interaction.response.send_message.call_args.args[0])
+        asyncio.run(scenario())
+        self.assertEqual(self.bot.STORE.preorder(row['id'])['status'], 'waiting')
+        self.assertEqual(self.bot.get_user_balance(42), balance)
+
+    def test_admin_can_cancel_customer_order_and_refund_customer_once(self):
+        row, _ = self.book()
+        self.bot.POLICY.config['admin_user_ids'] = [99]
+        async def scenario():
+            for command in (self.bot.cancelpreorder, self.bot.cancelcustomerpreorder):
+                interaction = self.interaction()
+                interaction.user = SimpleNamespace(id=99, name='admin')
+                for check in command.checks:
+                    self.assertTrue(await check(interaction))
+                await command.callback(interaction, row['id'])
+        asyncio.run(scenario())
+        self.assertEqual(self.bot.get_user_balance(42), 10000)
+        self.assertEqual(self.bot.STORE.preorder(row['id'])['status'], 'cancelled')
+
+    def test_admin_cannot_cancel_another_servers_preorder(self):
+        row, _ = self.book()
+        self.bot.POLICY.config['allowed_guild_ids'].append(456)
+        balance = self.bot.get_user_balance(42)
+        interaction = self.interaction()
+        interaction.guild.id = 456
+        asyncio.run(self.bot.cancelpreorder.callback(interaction, row['id']))
+        self.assertEqual(self.bot.STORE.preorder(row['id'])['status'], 'waiting')
+        self.assertEqual(self.bot.get_user_balance(42), balance)

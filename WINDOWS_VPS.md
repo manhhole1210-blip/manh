@@ -237,7 +237,7 @@ Khởi động lại để SQLite tự thêm bảng `preorders` và đồng bộ
   bot từ chối và không trừ tiền. Nút xác nhận lặp không tạo khoản trừ thứ hai.
 - `/mypreorders` xem tối đa 20 đơn chờ đầu tiên; đặt `waiting_only:False`
   để xem cả đơn đã phân hàng hoặc đã hủy. Mã PRE cũng là mã đơn hàng sau phân hàng.
-- `/cancelpreorder preorder_id` hủy đơn chưa phân hàng và hoàn đủ tiền **vào số dư bot**.
+- Chỉ admin được dùng `/cancelpreorder preorder_id` để hủy đơn chưa phân hàng và hoàn đủ tiền **vào số dư bot của khách**. Khách đã đặt trước không thể tự hủy.
   Không hoàn lại ngân hàng/Crypto. Đơn đã phân hàng (kể cả DM lỗi) không tự hoàn;
   dùng `/downloadorder` hoặc `/redeliver` để nhận hàng, không phải trả lần nữa.
 - Admin dùng `/preorders` xem tối đa 20 đơn chờ đầu tiên trong server,
@@ -255,6 +255,6 @@ Khởi động lại để SQLite tự thêm bảng `preorders` và đồng bộ
   thanh toán, hoàn tiền và phân hàng cho đến khi đối chiếu xong.
 
 Kiểm tra trên VPS bằng một đơn nhỏ: đặt lúc kho trống, xác nhận số dư giảm đúng,
-nhập kho, kiểm tra nhận đúng hàng và không bị trừ lần nữa. Thử hủy một đơn khác
+nhập kho, kiểm tra nhận đúng hàng và không bị trừ lần nữa. Dùng tài khoản admin hủy một đơn khác
 trước nhập kho để xác nhận hoàn đủ tiền một lần. Nếu chưa thấy nút mới, chờ panel
 cập nhật; slash `/preorder` luôn là cách truy cập trực tiếp trong server được phép.

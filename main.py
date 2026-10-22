@@ -5450,7 +5450,7 @@ def build_help_embed(language="vi"):
                 "`/stock` — Check the current account stock and pricing.\n"
                 "`/buy` — Open the purchase form to buy accounts.\n"
                 "`/preorder` — Prepay for automatic delivery when stock arrives.\n"
-                "`/mypreorders` — View preorders. `/cancelpreorder` — Cancel & refund.\n"
+                "`/mypreorders` — View preorders. Only admins can cancel.\n"
                 "`/topup` — Open the Vietcombank balance top-up form.\n"
                 "`/topupcrypto` — Open the crypto top-up form.\n"
                 "`/history` — View your top-up and order history.\n"
@@ -5509,7 +5509,7 @@ def build_help_embed(language="vi"):
                 "`/stock` — Kiểm tra kho account và bảng giá hiện tại.\n"
                 "`/buy` — Mở form mua account.\n"
                 "`/preorder` — Đặt trước, trả tiền và tự giao khi có hàng.\n"
-                "`/mypreorders` — Xem đơn. `/cancelpreorder` — Hủy và hoàn tiền.\n"
+                "`/mypreorders` — Xem đơn. Chỉ admin được hủy đơn.\n"
                 "`/topup` — Mở form nạp tiền qua Vietcombank.\n"
                 "`/topupcrypto` — Mở form nạp tiền bằng Crypto.\n"
                 "`/history` — Xem lịch sử nạp tiền và đơn hàng.\n"
@@ -6753,9 +6753,9 @@ class ConfirmPreorderView(View):
         lang = get_user_language(interaction.user.id)
         await interaction.edit_original_response(content=pick(lang,
             f"✅ Đơn đặt trước `{row['id']}` • {row['quantity']:,} account • Đã thanh toán {row['total']:,} VND.\n"
-            "Bot tự giao khi đủ hàng theo thứ tự đặt trước. Dùng /mypreorders để xem; /cancelpreorder để hủy và hoàn tiền nếu chưa phân hàng.",
+            "Bot tự giao khi đủ hàng theo thứ tự đặt trước. Dùng /mypreorders để xem. Khách không thể tự hủy; liên hệ admin nếu cần hỗ trợ.",
             f"✅ Preorder `{row['id']}` • {row['quantity']:,} accounts • Paid {row['total']:,} VND.\n"
-            "Automatic FIFO delivery when stock is sufficient. /mypreorders to view; /cancelpreorder to refund before allocation."), embed=None, view=None)
+            "Automatic FIFO delivery when stock is sufficient. /mypreorders to view. Customers cannot cancel; contact an admin for help."), embed=None, view=None)
         self.stop()
         await process_preorders()
 
@@ -6779,11 +6779,11 @@ async def preorder(interaction: discord.Interaction, product: str, quantity: app
         f"Thanh toán ngay: **{total:,} VND** (trừ từ số dư).\n"
         "Giá và thời hạn bảo hành được giữ theo đơn. Bot tự giao đủ đơn qua DM khi có hàng, ưu tiên đơn đặt trước theo thứ tự. "
         "Bảo hành bắt đầu lúc phân hàng. Chưa có cam kết ngày giao. "
-        "Có thể hủy và hoàn đủ tiền vào số dư trước khi phân hàng. Xác nhận bên dưới để thanh toán.",
+        "Đã đặt trước thì khách không thể tự hủy. Chỉ admin có thể hủy đơn chưa phân hàng và hoàn đủ tiền vào số dư. Xác nhận bên dưới để thanh toán.",
         f"Product: **{discord.utils.escape_markdown(target['name'])}**\nQuantity: **{quantity:,}**\n"
         f"Pay now: **{total:,} VND** from your balance.\n"
         "Price and warranty duration are locked. Full orders are automatically delivered via DM in FIFO order when stock arrives. "
-        "Warranty starts at allocation. No guaranteed delivery date. Cancel for a full wallet refund before allocation. Confirm below to pay.")
+        "Warranty starts at allocation. No guaranteed delivery date. Customers cannot cancel after ordering. Only admins can cancel before allocation and issue a full wallet refund. Confirm below to pay.")
     await interaction.response.send_message(embed=make_embed(pick(lang, '📋 Xác nhận đặt trước', '📋 Confirm Preorder'), description, UI_BLUE),
         view=ConfirmPreorderView(interaction.user.id, target, quantity, vnd(price), lang), ephemeral=True)
 
@@ -6817,17 +6817,25 @@ async def mypreorders(interaction: discord.Interaction, waiting_only: bool = Tru
     await interaction.response.send_message(embed=make_embed('📋 Đặt trước / Preorders (20 đơn đầu / first 20)', preorder_list_text(rows), UI_BLUE), ephemeral=True)
 
 
-@tree.command(name='cancelpreorder', description='Cancel your waiting preorder and refund its full payment to your balance')
+@tree.command(name='cancelpreorder', description='Admin: cancel a waiting preorder and refund the customer in full')
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin_check()
 async def cancelpreorder(interaction: discord.Interaction, preorder_id: str):
+    if not can_manage(interaction):
+        await interaction.response.send_message('❌ Chỉ admin được hủy đơn đặt trước / Only admins can cancel preorders.', ephemeral=True)
+        return
     try:
         async with SHOP_TRANSACTION_LOCK:
-            changed = refund_preorder(preorder_id.strip().upper(), interaction.user.id)
+            row = STORE.preorder(preorder_id.strip().upper())
+            if not row or row['guild_id'] != str(interaction.guild.id):
+                raise ValueError('Không tìm thấy đơn trong server / Preorder not found in this server.')
+            changed = refund_preorder(row['id'], interaction.user.id, admin=True)
     except ValueError as exc:
         await interaction.response.send_message(str(exc), ephemeral=True)
         return
-    await interaction.response.send_message('✅ Đã hủy và hoàn đủ tiền vào số dư / Cancelled and fully refunded.' if changed else
-        'ℹ️ Đơn đã hủy hoặc đã phân hàng; không hoàn tiền thêm / Already cancelled or fulfilled; no additional refund.', ephemeral=True)
+    await interaction.response.send_message('✅ Đã hủy và hoàn đủ tiền cho khách / Cancelled and fully refunded to the customer.' if changed else
+        'ℹ️ Đơn không còn chờ; không hoàn tiền thêm / No longer waiting; no additional refund.', ephemeral=True)
 
 
 @tree.command(name='preorders', description='Admin: view waiting prepaid preorders in this server')
@@ -6844,17 +6852,7 @@ async def preorders(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @admin_check()
 async def cancelcustomerpreorder(interaction: discord.Interaction, preorder_id: str):
-    try:
-        async with SHOP_TRANSACTION_LOCK:
-            row = STORE.preorder(preorder_id.strip().upper())
-            if not row or row['guild_id'] != str(interaction.guild.id):
-                raise ValueError('Không tìm thấy đơn trong server / Preorder not found in this server.')
-            changed = refund_preorder(row['id'], interaction.user.id, admin=True)
-    except ValueError as exc:
-        await interaction.response.send_message(str(exc), ephemeral=True)
-        return
-    await interaction.response.send_message('✅ Đã hủy và hoàn đủ tiền / Cancelled and fully refunded.' if changed else
-        'ℹ️ Đơn không còn chờ; không hoàn tiền thêm / No longer waiting; no additional refund.', ephemeral=True)
+    await cancelpreorder.callback(interaction, preorder_id)
 
 
 @tree.command(name="addstock", description="Admin: select a product and upload a TXT file to add stock")
