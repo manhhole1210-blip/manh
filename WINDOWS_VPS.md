@@ -221,3 +221,40 @@ Lệnh quản trị chỉ đăng ký ở server đã cấp quyền. Bản toàn 
 hàng dùng trong DM của bot; không còn hiển thị hai bản cùng tên trong server. Sau khi
 cập nhật main.py, khởi động lại và chờ cả sync server và sync global thành công, rồi
 Ctrl+R trên Discord để làm mới danh sách lệnh cũ.
+
+
+## Đặt trước trả đủ tiền
+
+Dừng bot trước khi thay cả `main.py` và `sqlite_store.py` từ cùng bản tải mới;
+giữ nguyên `data`, `operations.json` và token. Sao lưu bằng `/backup` trước khi dừng.
+Khởi động lại để SQLite tự thêm bảng `preorders` và đồng bộ các lệnh mới.
+
+- Khách bấm **Đặt trước** trên panel hoặc dùng `/preorder product quantity`.
+  Chọn sản phẩm, số lượng, xem tổng tiền rồi bấm **Xác nhận và trừ tiền**.
+  Không trừ tiền chỉ vì mở form. Tối đa 10 đơn chờ mỗi khách, 50.000 account/đơn.
+- Bot trừ đủ tiền từ số dư, giữ nguyên đơn giá và số ngày bảo hành tại lúc xác nhận.
+  Không cam kết ngày nhập hàng. Nếu số dư không đủ hoặc giá đổi trước xác nhận,
+  bot từ chối và không trừ tiền. Nút xác nhận lặp không tạo khoản trừ thứ hai.
+- `/mypreorders` xem tối đa 20 đơn chờ đầu tiên; đặt `waiting_only:False`
+  để xem cả đơn đã phân hàng hoặc đã hủy. Mã PRE cũng là mã đơn hàng sau phân hàng.
+- `/cancelpreorder preorder_id` hủy đơn chưa phân hàng và hoàn đủ tiền **vào số dư bot**.
+  Không hoàn lại ngân hàng/Crypto. Đơn đã phân hàng (kể cả DM lỗi) không tự hoàn;
+  dùng `/downloadorder` hoặc `/redeliver` để nhận hàng, không phải trả lần nữa.
+- Admin dùng `/preorders` xem tối đa 20 đơn chờ đầu tiên trong server,
+  `/cancelcustomerpreorder preorder_id` để hủy và hoàn tiền cho khách.
+  `/botstatus` hiển thị số đơn chờ và tổng tiền đã thu của các đơn đó.
+- Khi `/addstock` nhập hàng hoặc vòng cập nhật kho chạy, bot phân đủ số lượng cho từng
+  đơn theo thứ tự xác nhận, riêng từng sản phẩm. Đơn lớn ở đầu hàng chờ phải được
+  phân đủ trước; không chia nhỏ hoặc cho đơn nhỏ/mua thường vượt lên.
+  Kho thiếu không trừ thêm tiền. Phân hàng, lưu đơn và hàng đợi gửi DM nằm trong một
+  giao dịch SQLite. Gửi DM sử dụng lại cơ chế thử lại bền vững của bot.
+- Nếu sản phẩm đã đủ hàng, đơn đặt trước có thể được phân và giao ngay sau xác nhận.
+  Bảo hành bắt đầu khi phân hàng, không tính từ lúc trả tiền chờ hàng.
+- Xóa sản phẩm bằng `/removeproduct` tự hoàn đủ tiền cho các đơn còn chờ của sản phẩm
+  trong cùng giao dịch xóa. Đơn đã phân hàng được giữ. Khôi phục DB vẫn tạm dừng
+  thanh toán, hoàn tiền và phân hàng cho đến khi đối chiếu xong.
+
+Kiểm tra trên VPS bằng một đơn nhỏ: đặt lúc kho trống, xác nhận số dư giảm đúng,
+nhập kho, kiểm tra nhận đúng hàng và không bị trừ lần nữa. Thử hủy một đơn khác
+trước nhập kho để xác nhận hoàn đủ tiền một lần. Nếu chưa thấy nút mới, chờ panel
+cập nhật; slash `/preorder` luôn là cách truy cập trực tiếp trong server được phép.

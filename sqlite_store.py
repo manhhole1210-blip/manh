@@ -67,6 +67,15 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS documents (path TEXT PRIMARY KEY, payload TEXT NOT NULL CHECK(json_valid(payload)));
             CREATE TABLE IF NOT EXISTS processed_transactions (transaction_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS payment_claims (provider TEXT, payment_id TEXT, PRIMARY KEY(provider,payment_id));
+            CREATE TABLE IF NOT EXISTS preorders (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, guild_id TEXT NOT NULL,
+                product_id TEXT NOT NULL, product_name TEXT NOT NULL,
+                quantity INTEGER NOT NULL CHECK(quantity>0),
+                unit_price INTEGER NOT NULL CHECK(unit_price>=0),
+                total INTEGER NOT NULL CHECK(total>=0), warranty_days INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('waiting','fulfilled','cancelled')),
+                created_at TEXT NOT NULL, finished_at TEXT);
+            CREATE INDEX IF NOT EXISTS waiting_preorders ON preorders(status,created_at,id);
             CREATE TABLE IF NOT EXISTS topup_codes (
                 user_id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS bank_payments (
@@ -81,6 +90,26 @@ class SQLiteStore:
         ''')
         for table in self.ENTITY_TABLES.values():
             self.db.execute(f'CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, payload TEXT NOT NULL CHECK(json_valid(payload)))')
+
+    def preorder(self, preorder_id):
+        cursor = self.db.execute('SELECT * FROM preorders WHERE id=?', (preorder_id,))
+        row = cursor.fetchone()
+        return dict(zip((item[0] for item in cursor.description), row)) if row else None
+
+    def list_preorders(self, user_id=None, waiting_only=False, limit=20, guild_id=None):
+        filters, values = [], []
+        if user_id is not None:
+            filters.append('user_id=?')
+            values.append(str(user_id))
+        if guild_id is not None:
+            filters.append('guild_id=?')
+            values.append(str(guild_id))
+        if waiting_only:
+            filters.append("status='waiting'")
+        where = ' WHERE ' + ' AND '.join(filters) if filters else ''
+        cursor = self.db.execute('SELECT * FROM preorders' + where + ' ORDER BY created_at,id LIMIT ?', (*values, limit))
+        columns = [item[0] for item in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
     def get_topup_code(self, user_id):
         """Return a permanent, unique bank memo, including its LC prefix."""

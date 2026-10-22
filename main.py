@@ -18,7 +18,7 @@ import tempfile
 import secrets
 import hashlib
 import unicodedata
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
@@ -1182,6 +1182,9 @@ def remove_product(product_id, confirmed_stock_digest=None):
             return "stock_confirmation_required", product
         data["default_deleted"] = True
         with data_transaction():
+            for pending in STORE.list_preorders(waiting_only=True, limit=-1):
+                if pending['product_id'] == product_id:
+                    refund_preorder(pending['id'], 'system', admin=True)
             STORE.delete(path)
             save_products_data(data)
         return "removed", product
@@ -1198,6 +1201,9 @@ def remove_product(product_id, confirmed_stock_digest=None):
             return "stock_confirmation_required", product
         data["products"].pop(index)
         with data_transaction():
+            for pending in STORE.list_preorders(waiting_only=True, limit=-1):
+                if pending['product_id'] == product_id:
+                    refund_preorder(pending['id'], 'system', admin=True)
             STORE.delete(path)
             save_products_data(data)
         return "removed", product
@@ -2950,6 +2956,7 @@ class ShopPanelView(View):
             "lemon:shop:topup": text("topup", self.language),
             "lemon:shop:crypto": text("crypto", self.language),
             "lemon:shop:stock": text("stock", self.language),
+            "lemon:shop:preorder": pick(self.language, "Đặt trước", "Preorder"),
             "lemon:shop:orders": text("history", self.language),
             "lemon:shop:english": text("language", self.language),
         }
@@ -3099,6 +3106,21 @@ class ShopPanelView(View):
             ephemeral=True,
             **panel_banner_attach(lang)
         )
+
+    @discord.ui.button(label="Preorder", emoji="📋", style=discord.ButtonStyle.primary,
+                       custom_id="lemon:shop:preorder", row=2)
+    async def preorder_button(self, interaction: discord.Interaction, button: Button):
+        if not await ensure_allowed_interaction(interaction):
+            return
+        lang = get_user_language(interaction.user.id)
+        products = get_all_products()[:25]
+        if not products:
+            await interaction.response.send_message(pick(lang, 'Chưa có sản phẩm.', 'No products available.'), ephemeral=True)
+            return
+        view = View(timeout=180)
+        view.add_item(PreorderProductSelect(interaction.user.id, products, lang))
+        await interaction.response.send_message(pick(lang, 'Chọn sản phẩm để đặt trước (trả đủ tiền khi xác nhận):',
+            'Choose a product to preorder (full payment on confirmation):'), view=view, ephemeral=True)
 
     @discord.ui.button(
         label="History",
@@ -4483,6 +4505,12 @@ class ConfirmBuyView(View):
                 )
                 return
 
+            allocate_preorders()
+            if STORE.db.execute("SELECT 1 FROM preorders WHERE product_id=? AND status='waiting' LIMIT 1", (self.product['id'],)).fetchone():
+                await interaction.followup.send(pick(lang,
+                    '⏳ Hàng đang được ưu tiên cho đơn đặt trước. Bạn chưa bị trừ tiền. Dùng /preorder để vào hàng chờ.',
+                    '⏳ Stock is reserved for the preorder queue. No charge. Use /preorder to join.'), ephemeral=True)
+                return
             stock = load_product_stock(self.product)
 
             if len(stock) < self.quantity:
@@ -5386,9 +5414,11 @@ async def botstatus(interaction: discord.Interaction):
     backup = load_json(os.path.join(DATA_DIR, 'backup_status.json'), {})
     pending = STORE.db.execute("SELECT count(*) FROM bank_payments WHERE status='pending'").fetchone()[0]
     undelivered = STORE.db.execute("SELECT count(*) FROM deliveries WHERE status!='sent'").fetchone()[0]
+    preorder_count, prepaid = STORE.db.execute("SELECT count(*),coalesce(sum(total),0) FROM preorders WHERE status='waiting'").fetchone()
     integrity = STORE.db.execute('PRAGMA quick_check').fetchone()[0]
     message = (f"SQLite: {integrity}\nNgân hàng: {'OK' if health.get('bank', {}).get('ok') else 'chưa xác nhận / lỗi'}\n"
                f"Nạp cần đối soát: {pending}\nĐơn chưa giao: {undelivered}\n"
+               f"Đặt trước chờ hàng: {preorder_count} • Đã thu: {prepaid:,} VND\n"
                f"Backup gần nhất: {backup.get('file', 'chưa có')}\nServer được phép: {len(POLICY.config['allowed_guild_ids'])}\n"
                f"Tạm dừng nạp sau restore: {STORE.payments_paused()}")
     for name in ('bank-processing', 'crypto', 'backup'):
@@ -5419,6 +5449,8 @@ def build_help_embed(language="vi"):
                 "`/profile` — View your username, User ID and current balance.\n"
                 "`/stock` — Check the current account stock and pricing.\n"
                 "`/buy` — Open the purchase form to buy accounts.\n"
+                "`/preorder` — Prepay for automatic delivery when stock arrives.\n"
+                "`/mypreorders` — View preorders. `/cancelpreorder` — Cancel & refund.\n"
                 "`/topup` — Open the Vietcombank balance top-up form.\n"
                 "`/topupcrypto` — Open the crypto top-up form.\n"
                 "`/history` — View your top-up and order history.\n"
@@ -5476,6 +5508,8 @@ def build_help_embed(language="vi"):
                 "`/profile` — Xem tên người dùng, User ID và số dư hiện tại.\n"
                 "`/stock` — Kiểm tra kho account và bảng giá hiện tại.\n"
                 "`/buy` — Mở form mua account.\n"
+                "`/preorder` — Đặt trước, trả tiền và tự giao khi có hàng.\n"
+                "`/mypreorders` — Xem đơn. `/cancelpreorder` — Hủy và hoàn tiền.\n"
                 "`/topup` — Mở form nạp tiền qua Vietcombank.\n"
                 "`/topupcrypto` — Mở form nạp tiền bằng Crypto.\n"
                 "`/history` — Xem lịch sử nạp tiền và đơn hàng.\n"
@@ -6557,6 +6591,272 @@ async def removetier_tier_autocomplete(
 MAX_STOCK_UPLOAD_LINES = 50_000
 
 
+# Paid preorders: debit, FIFO stock allocation, refund and delivery outbox are atomic.
+def create_paid_preorder(preorder_id, user, guild_id, product_id, quantity, quoted_price):
+    existing = STORE.preorder(preorder_id)
+    if existing:
+        if existing['user_id'] != str(user.id):
+            raise ValueError('Đơn không thuộc về bạn / Not your preorder.')
+        return existing, False
+    if STORE.payments_paused():
+        raise ValueError('Shop đang đối chiếu dữ liệu sau khôi phục / Shop maintenance.')
+    if not isinstance(quantity, int) or isinstance(quantity, bool) or not 1 <= quantity <= 50000:
+        raise ValueError('Số lượng không hợp lệ / Invalid quantity.')
+    product = get_product_by_id(product_id)
+    if product is None:
+        raise ValueError('Sản phẩm đã ngừng bán / Product unavailable.')
+    price = product_price(product, quantity)
+    if price is None or vnd(price) != quoted_price:
+        raise ValueError('Giá đã thay đổi. Hãy tạo lại yêu cầu / Price changed; start again.')
+    total = vnd(quoted_price * quantity)
+    ensure_user(user)
+    if get_user_balance(user.id) < total:
+        raise ValueError('Số dư không đủ / Insufficient balance.')
+    if len(STORE.list_preorders(user_id=user.id, waiting_only=True, limit=10)) >= 10:
+        raise ValueError('Tối đa 10 đơn đang chờ / At most 10 waiting preorders.')
+    with data_transaction():
+        users[str(user.id)]['balance'] = get_user_balance(user.id) - total
+        save_json(USERS_FILE, users)
+        STORE.db.execute(
+            "INSERT INTO preorders VALUES (?,?,?,?,?,?,?,?,?,'waiting',?,NULL)",
+            (preorder_id, str(user.id), str(guild_id), product_id, product['name'], quantity,
+             quoted_price, total, product_warranty_days(product), datetime.now().isoformat()))
+        log_activity(user.id, user.name, 'preorder_paid',
+                     {'preorder_id': preorder_id, 'product_id': product_id, 'quantity': quantity, 'total': total}, 'command')
+    return STORE.preorder(preorder_id), True
+
+
+def refund_preorder(preorder_id, actor_id, admin=False):
+    row = STORE.preorder(preorder_id)
+    if not row or (not admin and row['user_id'] != str(actor_id)):
+        raise ValueError('Không tìm thấy đơn của bạn / Preorder not found.')
+    if row['status'] != 'waiting':
+        return False
+    if STORE.payments_paused():
+        raise ValueError('Shop đang đối chiếu dữ liệu sau khôi phục / Shop maintenance.')
+    if row['user_id'] not in users:
+        raise ValueError('Thiếu ví khách hàng; liên hệ admin / Customer wallet missing.')
+    with (nullcontext() if STORE.db.in_transaction else data_transaction()):
+        users[row['user_id']]['balance'] = vnd(get_user_balance(row['user_id']) + row['total'])
+        save_json(USERS_FILE, users)
+        STORE.db.execute("UPDATE preorders SET status='cancelled',finished_at=? WHERE id=? AND status='waiting'",
+                         (datetime.now().isoformat(), preorder_id))
+        log_activity(actor_id if str(actor_id).isdigit() else row['user_id'], str(actor_id), 'preorder_refunded',
+                     {'preorder_id': preorder_id, 'actor_id': str(actor_id), 'user_id': row['user_id'], 'total': row['total']}, 'command')
+    return True
+
+
+def allocate_preorders():
+    """Called under SHOP_TRANSACTION_LOCK; never await during allocation."""
+    if STORE.payments_paused():
+        return []
+    allocated, blocked = [], set()
+    for row in STORE.list_preorders(waiting_only=True, limit=-1):
+        product_id = row['product_id']
+        product = get_product_by_id(product_id)
+        if product is None:
+            refund_preorder(row['id'], 'system', admin=True)
+            continue
+        if not POLICY.allowed_guild(int(row['guild_id'])) or product_id in blocked:
+            blocked.add(product_id)
+            continue
+        stock = load_product_stock(product)
+        if len(stock) < row['quantity']:
+            blocked.add(product_id)  # Strict FIFO per product; never split an order.
+            continue
+        now = datetime.now()
+        with data_transaction():
+            save_product_stock(product, stock[row['quantity']:])
+            if product.get('tiered'):
+                sales = load_sales()
+                sales['total_sold'] = int(sales.get('total_sold', 0)) + row['quantity']
+                save_json(SALES_FILE, sales)
+            else:
+                increment_product_sold(product_id, row['quantity'])
+            save_order(row['id'], {
+                'user_id': int(row['user_id']), 'username': users.get(row['user_id'], {}).get('username', ''),
+                'product': row['product_name'], 'product_id': product_id, 'quantity': row['quantity'],
+                'unit_price': row['unit_price'], 'total': row['total'], 'warranty_days': row['warranty_days'],
+                'status': 'completed', 'delivery_status': 'pending', 'accounts': stock[:row['quantity']],
+                'created_at': now.isoformat(), 'preordered_at': row['created_at'], 'preorder_id': row['id']})
+            STORE.db.execute("UPDATE preorders SET status='fulfilled',finished_at=? WHERE id=? AND status='waiting'",
+                             (now.isoformat(), row['id']))
+            log_activity(row['user_id'], '', 'preorder_fulfilled', {'preorder_id': row['id'], 'quantity': row['quantity']}, 'system')
+        allocated.append(row['id'])
+    return allocated
+
+
+async def process_preorders():
+    async with SHOP_TRANSACTION_LOCK:
+        allocated = allocate_preorders()
+    for order_id in allocated:
+        try:
+            await deliver_order(order_id)
+        except Exception as exc:
+            logging.error('[PREORDER] Delivery queued for retry (%s)', type(exc).__name__)
+    return allocated
+
+
+class PreorderQuantityModal(Modal):
+    def __init__(self, product_id, lang):
+        super().__init__(title=pick(lang, 'Số lượng đặt trước', 'Preorder Quantity'))
+        self.product_id = product_id
+        self.amount = TextInput(label=pick(lang, 'Số lượng (1–50.000)', 'Quantity (1–50,000)'), max_length=5)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.amount.value.strip()
+        if not raw.isascii() or not raw.isdigit() or not 1 <= int(raw) <= 50000:
+            await interaction.response.send_message('❌ Số lượng / Quantity: 1–50,000.', ephemeral=True)
+            return
+        await preorder.callback(interaction, self.product_id, int(raw))
+
+
+class PreorderProductSelect(discord.ui.Select):
+    def __init__(self, user_id, products, lang):
+        super().__init__(placeholder=pick(lang, 'Chọn sản phẩm', 'Select product'),
+                         options=[discord.SelectOption(label=p['name'][:100], value=p['id']) for p in products])
+        self.user_id, self.lang = user_id, lang
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await ensure_allowed_interaction(interaction):
+            return
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('❌ Không phải yêu cầu của bạn / Not your request.', ephemeral=True)
+            return
+        await interaction.response.send_modal(PreorderQuantityModal(self.values[0], self.lang))
+
+
+class ConfirmPreorderView(View):
+    def __init__(self, user_id, product, quantity, price, lang):
+        super().__init__(timeout=180)
+        self.user_id, self.product_id = user_id, product['id']
+        self.quantity, self.price = quantity, price
+        self.preorder_id = 'PRE-' + secrets.token_hex(8).upper()
+        self.children[0].label = pick(lang, 'Xác nhận và trừ tiền', 'Confirm & Pay')
+
+    @discord.ui.button(label='Confirm & Pay', style=discord.ButtonStyle.success, emoji='✅')
+    async def confirm(self, interaction: discord.Interaction, button: Button):
+        if not await ensure_allowed_interaction(interaction):
+            return
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('❌ Đơn không thuộc về bạn / Not your preorder.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with SHOP_TRANSACTION_LOCK:
+                row, created = create_paid_preorder(self.preorder_id, interaction.user, interaction.guild.id,
+                                                    self.product_id, self.quantity, self.price)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        lang = get_user_language(interaction.user.id)
+        await interaction.edit_original_response(content=pick(lang,
+            f"✅ Đơn đặt trước `{row['id']}` • {row['quantity']:,} account • Đã thanh toán {row['total']:,} VND.\n"
+            "Bot tự giao khi đủ hàng theo thứ tự đặt trước. Dùng /mypreorders để xem; /cancelpreorder để hủy và hoàn tiền nếu chưa phân hàng.",
+            f"✅ Preorder `{row['id']}` • {row['quantity']:,} accounts • Paid {row['total']:,} VND.\n"
+            "Automatic FIFO delivery when stock is sufficient. /mypreorders to view; /cancelpreorder to refund before allocation."), embed=None, view=None)
+        self.stop()
+        await process_preorders()
+
+
+@tree.command(name='preorder', description='Prepay a product and receive automatic delivery when stock arrives')
+@app_commands.guild_only()
+@app_commands.describe(product='Choose a product', quantity='Number of accounts to preorder')
+async def preorder(interaction: discord.Interaction, product: str, quantity: app_commands.Range[int, 1, 50000]):
+    if not await ensure_allowed_interaction(interaction):
+        return
+    ensure_user(interaction.user)
+    target = find_product_by_query(product)
+    lang = get_user_language(interaction.user.id)
+    price = product_price(target, quantity) if target else None
+    if price is None:
+        await interaction.response.send_message(pick(lang, '❌ Sản phẩm hoặc bậc giá không hợp lệ.', '❌ Product or quantity tier unavailable.'), ephemeral=True)
+        return
+    total = vnd(vnd(price) * quantity)
+    description = pick(lang,
+        f"Sản phẩm: **{discord.utils.escape_markdown(target['name'])}**\nSố lượng: **{quantity:,}**\n"
+        f"Thanh toán ngay: **{total:,} VND** (trừ từ số dư).\n"
+        "Giá và thời hạn bảo hành được giữ theo đơn. Bot tự giao đủ đơn qua DM khi có hàng, ưu tiên đơn đặt trước theo thứ tự. "
+        "Bảo hành bắt đầu lúc phân hàng. Chưa có cam kết ngày giao. "
+        "Có thể hủy và hoàn đủ tiền vào số dư trước khi phân hàng. Xác nhận bên dưới để thanh toán.",
+        f"Product: **{discord.utils.escape_markdown(target['name'])}**\nQuantity: **{quantity:,}**\n"
+        f"Pay now: **{total:,} VND** from your balance.\n"
+        "Price and warranty duration are locked. Full orders are automatically delivered via DM in FIFO order when stock arrives. "
+        "Warranty starts at allocation. No guaranteed delivery date. Cancel for a full wallet refund before allocation. Confirm below to pay.")
+    await interaction.response.send_message(embed=make_embed(pick(lang, '📋 Xác nhận đặt trước', '📋 Confirm Preorder'), description, UI_BLUE),
+        view=ConfirmPreorderView(interaction.user.id, target, quantity, vnd(price), lang), ephemeral=True)
+
+
+@preorder.autocomplete('product')
+async def preorder_product_autocomplete(interaction: discord.Interaction, current: str):
+    if not POLICY.allowed_guild(getattr(interaction.guild, 'id', None)):
+        return []
+    query = current.strip().casefold()
+    return [app_commands.Choice(name=p['name'][:100], value=p['id']) for p in get_all_products()
+            if not query or query in p['name'].casefold() or query in p['id'].casefold()][:25]
+
+
+def preorder_list_text(rows, admin=False):
+    labels = {'waiting': '⏳ Chờ hàng / Waiting', 'fulfilled': '✅ Đã phân hàng / Fulfilled', 'cancelled': '↩️ Đã hoàn tiền / Refunded'}
+    result = []
+    for row in rows:
+        name = discord.utils.escape_markdown(row['product_name'])[:70]
+        owner = f" • <@{row['user_id']}>" if admin else ''
+        line = f"`{row['id']}`{owner}\n{name} × {row['quantity']:,} • {row['total']:,} VND • {labels[row['status']]}"
+        if len('\n\n'.join(result + [line])) > 3800:
+            break
+        result.append(line)
+    return '\n\n'.join(result) or 'Chưa có đơn / No preorders.'
+
+
+@tree.command(name='mypreorders', description='View your prepaid preorders and their status')
+@app_commands.guild_only()
+async def mypreorders(interaction: discord.Interaction, waiting_only: bool = True):
+    rows = STORE.list_preorders(user_id=interaction.user.id, guild_id=interaction.guild.id, waiting_only=waiting_only, limit=20)
+    await interaction.response.send_message(embed=make_embed('📋 Đặt trước / Preorders (20 đơn đầu / first 20)', preorder_list_text(rows), UI_BLUE), ephemeral=True)
+
+
+@tree.command(name='cancelpreorder', description='Cancel your waiting preorder and refund its full payment to your balance')
+@app_commands.guild_only()
+async def cancelpreorder(interaction: discord.Interaction, preorder_id: str):
+    try:
+        async with SHOP_TRANSACTION_LOCK:
+            changed = refund_preorder(preorder_id.strip().upper(), interaction.user.id)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    await interaction.response.send_message('✅ Đã hủy và hoàn đủ tiền vào số dư / Cancelled and fully refunded.' if changed else
+        'ℹ️ Đơn đã hủy hoặc đã phân hàng; không hoàn tiền thêm / Already cancelled or fulfilled; no additional refund.', ephemeral=True)
+
+
+@tree.command(name='preorders', description='Admin: view waiting prepaid preorders in this server')
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin_check()
+async def preorders(interaction: discord.Interaction):
+    rows = STORE.list_preorders(waiting_only=True, guild_id=interaction.guild.id, limit=20)
+    await interaction.response.send_message(embed=make_embed('📋 Đơn chờ / Waiting preorders (first 20)', preorder_list_text(rows, admin=True), UI_BLUE), ephemeral=True)
+
+
+@tree.command(name='cancelcustomerpreorder', description='Admin: cancel a waiting customer preorder and refund its full payment')
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin_check()
+async def cancelcustomerpreorder(interaction: discord.Interaction, preorder_id: str):
+    try:
+        async with SHOP_TRANSACTION_LOCK:
+            row = STORE.preorder(preorder_id.strip().upper())
+            if not row or row['guild_id'] != str(interaction.guild.id):
+                raise ValueError('Không tìm thấy đơn trong server / Preorder not found in this server.')
+            changed = refund_preorder(row['id'], interaction.user.id, admin=True)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    await interaction.response.send_message('✅ Đã hủy và hoàn đủ tiền / Cancelled and fully refunded.' if changed else
+        'ℹ️ Đơn không còn chờ; không hoàn tiền thêm / No longer waiting; no additional refund.', ephemeral=True)
+
+
 @tree.command(name="addstock", description="Admin: select a product and upload a TXT file to add stock")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -6652,6 +6952,7 @@ async def addstock(interaction: discord.Interaction, product: str, file: discord
         embed.add_field(name=name, value=f"{value:,}", inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
     if added:
+        await process_preorders()
         try:
             await update_stock_message()
         except Exception as exc:
@@ -8116,6 +8417,7 @@ async def removestockmessage(
 @tasks.loop(seconds=5)
 async def main_loop():
     try:
+        await process_preorders()
         await update_stock_message()
     except Exception as exc:
         logging.warning('[STOCK] Panel refresh failed (%s)', type(exc).__name__)

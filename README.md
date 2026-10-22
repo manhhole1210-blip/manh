@@ -189,3 +189,5 @@ GitHub Actions chạy bộ kiểm thử trên Ubuntu và Windows/Python 3.12, đ
 cú pháp các script PowerShell trên Windows. Kết quả từng lần chạy nằm trong tab Actions.
 
 Mã nạp ngân hàng: mỗi khách được cấp mã cố định 8 ký tự, ví dụ `LCK7M9X2`, khi tạo yêu cầu nạp. Mã lưu trong SQLite, không đổi theo username hoặc khi khởi động lại. QR tự điền mã; mã LC + User ID cũ vẫn được hỗ trợ. Giao dịch dùng username cũ vẫn cần đối soát. Khi nâng cấp, thay cả `main.py` và `sqlite_store.py`, giữ nguyên `data/bot.db`.
+
+Đặt trước trả đủ tiền: nút **Đặt trước** hoặc `/preorder`; `/mypreorders` xem đơn, `/cancelpreorder` hủy đơn chưa phân hàng và hoàn đủ vào số dư. Tự phân hàng FIFO khi nhập kho, không trừ tiền lần nữa. Admin: `/preorders`, `/cancelcustomerpreorder`. Nâng cấp cả `main.py` và `sqlite_store.py`, giữ nguyên dữ liệu. Chi tiết trong WINDOWS_VPS.md.
