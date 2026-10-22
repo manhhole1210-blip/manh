@@ -2935,6 +2935,59 @@ def build_stock_embed(language="vi"):
     return build_panel_embed(language)
 
 
+# Keep one private shop response per customer/channel; never delete the public panel.
+_SHOP_WINDOWS = {}
+_SHOP_WINDOW_LOCKS = {}
+
+
+def shop_window_key(interaction):
+    return (getattr(getattr(interaction, 'guild', None), 'id', None),
+            getattr(interaction, 'channel_id', None), interaction.user.id)
+
+
+async def delete_shop_window(previous):
+    delete = getattr(previous, 'delete_original_response', None)
+    if delete is not None:
+        try:
+            await delete()
+        except (discord.HTTPException, OSError):
+            # Expired Discord interaction tokens cannot remove an old response.
+            logging.info('[SHOP] Previous private window expired or unavailable')
+
+
+async def close_shop_window(interaction):
+    key = shop_window_key(interaction)
+    lock = _SHOP_WINDOW_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        previous = _SHOP_WINDOWS.pop(key, None)
+        if previous:
+            await delete_shop_window(previous[0])
+
+
+async def send_shop_response(interaction, *args, followup=False, **kwargs):
+    key = shop_window_key(interaction)
+    lock = _SHOP_WINDOW_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        kwargs['ephemeral'] = True
+        # Create the replacement first, so a send failure preserves the old screen.
+        if followup:
+            await interaction.followup.send(*args, **kwargs)
+        else:
+            await interaction.response.send_message(*args, **kwargs)
+        previous = _SHOP_WINDOWS.get(key)
+        _SHOP_WINDOWS[key] = (interaction, time.monotonic())
+        if previous and previous[0] is not interaction:
+            await delete_shop_window(previous[0])
+        # Tokens last 15 minutes. Bound the process-local cache without persisting tokens.
+        stale = [k for k, (_, created) in _SHOP_WINDOWS.items() if time.monotonic() - created > 840]
+        for old_key in stale:
+            _SHOP_WINDOWS.pop(old_key, None)
+            if old_key != key:
+                old_lock = _SHOP_WINDOW_LOCKS.get(old_key)
+                if old_lock and not old_lock.locked():
+                    _SHOP_WINDOW_LOCKS.pop(old_key, None)
+
+
 class ShopPanelView(View):
     """
     Persistent premium shop panel.
@@ -3042,7 +3095,7 @@ class ShopPanelView(View):
             inline=False
         )
 
-        await interaction.response.send_message(
+        await send_shop_response(interaction,
             embed=embed,
             ephemeral=True
         )
@@ -3065,6 +3118,7 @@ class ShopPanelView(View):
         await interaction.response.send_modal(
             TopupModal(get_user_language(interaction.user.id))
         )
+        await close_shop_window(interaction)
 
     @discord.ui.button(
         label="Crypto",
@@ -3084,6 +3138,7 @@ class ShopPanelView(View):
         await interaction.response.send_modal(
             CryptoModal(get_user_language(interaction.user.id))
         )
+        await close_shop_window(interaction)
 
     @discord.ui.button(
         label="Stock",
@@ -3100,7 +3155,7 @@ class ShopPanelView(View):
         if not await ensure_allowed_interaction(interaction):
             return False
         lang = get_user_language(interaction.user.id)
-        await interaction.response.send_message(
+        await send_shop_response(interaction,
             embed=build_stock_embed(lang),
             view=ShopPanelView(lang),
             ephemeral=True,
@@ -3115,11 +3170,11 @@ class ShopPanelView(View):
         lang = get_user_language(interaction.user.id)
         products = get_all_products()[:25]
         if not products:
-            await interaction.response.send_message(pick(lang, 'Chưa có sản phẩm.', 'No products available.'), ephemeral=True)
+            await send_shop_response(interaction,pick(lang, 'Chưa có sản phẩm.', 'No products available.'), ephemeral=True)
             return
         view = View(timeout=180)
         view.add_item(PreorderProductSelect(interaction.user.id, products, lang))
-        await interaction.response.send_message(pick(lang, 'Chọn sản phẩm để đặt trước (trả đủ tiền khi xác nhận):',
+        await send_shop_response(interaction,pick(lang, 'Chọn sản phẩm để đặt trước (trả đủ tiền khi xác nhận):',
             'Choose a product to preorder (full payment on confirmation):'), view=view, ephemeral=True)
 
     @discord.ui.button(
@@ -3189,7 +3244,7 @@ class ShopPanelView(View):
             )
         else:
             embed.add_field(name=order_title, value=no_order, inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await send_shop_response(interaction,embed=embed, ephemeral=True)
 
     @discord.ui.button(
         label="English",
@@ -3228,7 +3283,7 @@ class ShopPanelView(View):
         localized_view = ShopPanelView(new_language)
         localized_embed = build_localized_panel_embed(new_language)
 
-        await interaction.response.send_message(
+        await send_shop_response(interaction,
             embed=localized_embed,
             view=localized_view,
             ephemeral=True,
@@ -3793,7 +3848,7 @@ class BuyModal(Modal):
             )
 
         except ValueError:
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 pick(
                     lang,
                     "❌ **Số lượng không hợp lệ**\n"
@@ -3806,7 +3861,7 @@ class BuyModal(Modal):
             return
 
         if quantity < 1:
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 pick(
                     lang,
                     "❌ Số lượng phải **từ 1 trở lên**.",
@@ -3828,7 +3883,7 @@ class BuyModal(Modal):
                     product_tiers(self.product), lang
                 )
             )
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 pick(
                     lang,
                     f"❌ Chưa có giá cho **{quantity:,}** account.\n"
@@ -3857,7 +3912,7 @@ class BuyModal(Modal):
                 UI_RED
             )
 
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 embed=embed,
                 ephemeral=True
             )
@@ -3895,7 +3950,7 @@ class BuyModal(Modal):
                 UI_RED
             )
 
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 embed=embed,
                 view=ShopPanelView(lang),
                 ephemeral=True
@@ -3996,7 +4051,7 @@ class BuyModal(Modal):
             self.product
         )
 
-        await interaction.response.send_message(
+        await send_shop_response(interaction,
             embed=embed,
             view=view,
             ephemeral=True
@@ -4164,14 +4219,14 @@ async def open_buy_flow(interaction: discord.Interaction):
     """Buy button and /buy: straight to the quantity form, or pick a product first."""
 
     if STORE.payments_paused():
-        await interaction.response.send_message('🛠️ Shop đang đối chiếu dữ liệu sau khôi phục. Vui lòng quay lại sau.', ephemeral=True)
+        await send_shop_response(interaction,'🛠️ Shop đang đối chiếu dữ liệu sau khôi phục. Vui lòng quay lại sau.', ephemeral=True)
         return
     lang = get_user_language(interaction.user.id)
     products = get_all_products()
 
     embed = build_choose_product_embed(lang)
 
-    await interaction.response.send_message(
+    await send_shop_response(interaction,
         embed=embed,
         view=ProductSelectView(interaction.user.id, lang, products),
         ephemeral=True
@@ -4830,7 +4885,7 @@ class TopupModal(Modal):
                 UI_RED
             )
 
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 embed=embed,
                 ephemeral=True
             )
@@ -4841,7 +4896,7 @@ class TopupModal(Modal):
         )
 
         if amount < 2000:
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 embed=make_embed(
                     pick(lang, "❌ Số tiền nạp tối thiểu", "❌ Minimum Top Up"),
                     pick(
@@ -4863,7 +4918,7 @@ class TopupModal(Modal):
             == "YOUR_VCB_ACCOUNT_NUMBER"
         ):
 
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 embed=make_embed(
                     pick(
                         lang,
@@ -4962,7 +5017,7 @@ class TopupModal(Modal):
 
         view = View(timeout=120)
 
-        await interaction.response.send_message(
+        await send_shop_response(interaction,
             embed=embed,
             view=view,
             ephemeral=True
@@ -5009,7 +5064,7 @@ class CryptoModal(Modal):
             )
 
         except InvalidOperation:
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 embed=make_embed(
                     pick(lang, "❌ Số tiền không hợp lệ", "❌ Invalid Amount"),
                     pick(
@@ -5024,7 +5079,7 @@ class CryptoModal(Modal):
             return
 
         if not amount_usd.is_finite() or amount_usd <= 0 or amount_usd > Decimal("1000000000"):
-            await interaction.response.send_message(
+            await send_shop_response(interaction,
                 embed=make_embed(
                     pick(lang, "❌ Số tiền không hợp lệ", "❌ Invalid Amount"),
                     pick(
@@ -5053,7 +5108,7 @@ class CryptoModal(Modal):
         )
 
         if error:
-            await interaction.followup.send(
+            await send_shop_response(interaction, followup=True,
                 embed=make_embed(
                     pick(lang, "❌ Lỗi tạo hóa đơn", "❌ Invoice Error"),
                     (
@@ -5091,7 +5146,7 @@ class CryptoModal(Modal):
             result,
             dict
         ):
-            await interaction.followup.send(
+            await send_shop_response(interaction, followup=True,
                 embed=make_embed(
                     pick(lang, "❌ Lỗi thanh toán", "❌ Payment Error"),
                     pick(
@@ -5114,7 +5169,7 @@ class CryptoModal(Modal):
         )
 
         if not trans_id:
-            await interaction.followup.send(
+            await send_shop_response(interaction, followup=True,
                 embed=make_embed(
                     pick(lang, "❌ Lỗi thanh toán", "❌ Payment Error"),
                     pick(
@@ -5206,7 +5261,7 @@ class CryptoModal(Modal):
                 )
             )
 
-        await interaction.followup.send(
+        await send_shop_response(interaction, followup=True,
             embed=embed,
             view=view,
             ephemeral=True
@@ -6803,7 +6858,7 @@ async def preorder(interaction: discord.Interaction, product: str, quantity: app
     lang = get_user_language(interaction.user.id)
     price = product_price(target, quantity) if target else None
     if price is None:
-        await interaction.response.send_message(pick(lang, '❌ Sản phẩm hoặc bậc giá không hợp lệ.', '❌ Product or quantity tier unavailable.'), ephemeral=True)
+        await send_shop_response(interaction,pick(lang, '❌ Sản phẩm hoặc bậc giá không hợp lệ.', '❌ Product or quantity tier unavailable.'), ephemeral=True)
         return
     total = vnd(vnd(price) * quantity)
     description = pick(lang,
@@ -6816,7 +6871,7 @@ async def preorder(interaction: discord.Interaction, product: str, quantity: app
         f"Pay now: **{total:,} VND** from your balance.\n"
         "Price and warranty duration are locked. Full orders are automatically delivered via DM in FIFO order when stock arrives. "
         "Warranty starts at allocation. No guaranteed delivery date. Customers cannot cancel after ordering. Only admins can cancel before allocation and issue a full wallet refund. Confirm below to pay.")
-    await interaction.response.send_message(embed=make_embed(pick(lang, '📋 Xác nhận đặt trước', '📋 Confirm Preorder'), description, UI_BLUE),
+    await send_shop_response(interaction,embed=make_embed(pick(lang, '📋 Xác nhận đặt trước', '📋 Confirm Preorder'), description, UI_BLUE),
         view=ConfirmPreorderView(interaction.user.id, target, quantity, vnd(price), lang), ephemeral=True)
 
 

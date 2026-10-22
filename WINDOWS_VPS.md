@@ -278,3 +278,14 @@ File toàn dòng trùng không hiện câu hỏi. Kho vẫn nhập bình thườ
 kênh hoặc gửi thông báo thất bại; bot báo riêng để admin cấu hình/thử lại, không nhập
 lại file. Tắt/khởi động lại bot sẽ đóng câu hỏi đang chờ, không tự đăng lại.
 Cập nhật tính năng này bằng cách thay `main.py`, giữ nguyên dữ liệu và khởi động lại.
+
+
+## Một cửa sổ thao tác riêng
+
+Các nút cửa hàng (mua, lịch sử, hồ sơ, kho, đổi ngôn ngữ, đặt trước) thay cửa sổ
+riêng trước đó của cùng khách trong cùng kênh. Bot gửi màn mới thành công rồi xóa
+phản hồi riêng cũ; không xóa bảng cửa hàng công khai hoặc màn của khách khác.
+Mở form nạp ngân hàng/Crypto cũng đóng màn riêng cũ. Dữ liệu đơn, số dư, hóa đơn
+DM và hàng chờ không bị xóa khi đóng cửa sổ. Danh sách cửa sổ chỉ lưu trong RAM,
+không lưu token interaction vào SQLite. Sau khởi động lại hoặc khi token Discord
+cũ đã hết hạn, một số màn cũ cần khách bấm **Bỏ qua tin nhắn** thủ công.
