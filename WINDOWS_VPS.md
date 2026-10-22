@@ -289,3 +289,5 @@ Mở form nạp ngân hàng/Crypto cũng đóng màn riêng cũ. Dữ liệu đ�
 DM và hàng chờ không bị xóa khi đóng cửa sổ. Danh sách cửa sổ chỉ lưu trong RAM,
 không lưu token interaction vào SQLite. Sau khởi động lại hoặc khi token Discord
 cũ đã hết hạn, một số màn cũ cần khách bấm **Bỏ qua tin nhắn** thủ công.
+
+Thông báo nhập kho công khai luôn hiển thị song ngữ Việt/Anh trong cùng một embed, không phụ thuộc ngôn ngữ của admin nhập kho.

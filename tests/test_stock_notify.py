@@ -48,6 +48,10 @@ class StockNotifyTests(unittest.TestCase):
             kwargs = channel.send.call_args.kwargs
             content = str(kwargs['embed'].to_dict())
             self.assertIn('Public Product', content)
+            self.assertIn('Stock Added', content)
+            self.assertIn('Quantity added', content)
+            self.assertIn('Use /stock', content)
+            self.assertIn('Dùng /stock', content)
             self.assertNotIn('password', content)
             self.assertNotIn('account1', content)
             self.assertNotIn('file', kwargs)

@@ -7006,12 +7006,12 @@ class StockNotifyView(View):
                     await interaction.followup.send('❌ Kênh thông báo không thuộc server này. Dùng /setstocknotify để chọn lại.', ephemeral=True)
                     return
                 # Only public catalog data and counts; no uploaded credentials or file.
-                embed = make_embed(pick(self.lang, '📦 Lemon Service • Vừa nhập hàng', '📦 Lemon Service • Stock Added'),
+                embed = make_embed('📦 Lemon Service • Vừa nhập hàng / Stock Added',
                     f"**{discord.utils.escape_markdown(self.product_name)[:500]}**", UI_GREEN)
-                embed.add_field(name=pick(self.lang, 'Số lượng vừa nhập', 'Quantity added'), value=f'{self.quantity:,}', inline=False)
-                embed.add_field(name=pick(self.lang, 'Mua hàng', 'Shop'), value=pick(self.lang,
-                    'Dùng /stock để kiểm tra hàng còn lại và /buy để mua. Đơn đặt trước được ưu tiên phân hàng.',
-                    'Use /stock for remaining stock and /buy to purchase. Preorders receive priority allocation.'), inline=False)
+                embed.add_field(name='Số lượng vừa nhập / Quantity added', value=f'{self.quantity:,}', inline=False)
+                embed.add_field(name='Mua hàng / Shop', value=(
+                    '🇻🇳 Dùng /stock để kiểm tra hàng còn lại và /buy để mua. Đơn đặt trước được ưu tiên phân hàng.\n\n'
+                    '🇬🇧 Use /stock for remaining stock and /buy to purchase. Preorders receive priority allocation.'), inline=False)
                 await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             except (discord.HTTPException, OSError, ValueError):
                 logging.warning('[STOCK] Announcement failed; stock upload remains committed')
