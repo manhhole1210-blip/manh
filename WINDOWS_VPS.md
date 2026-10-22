@@ -263,3 +263,18 @@ Sau khi thanh toán đặt trước, khách nhận hóa đơn embed riêng ngay 
 và một bản qua DM (mỗi đơn mới gửi một lần). Hóa đơn gồm mã PRE, khách hàng, sản phẩm,
 số lượng, đơn giá, tổng tiền, thời gian đặt và trạng thái. Nếu DM bị chặn, bot báo
 ngay tại phản hồi riêng; đơn và tiền đã trả vẫn được lưu, không trừ hoặc hoàn lại tự động.
+
+
+## Thông báo nhập kho tùy chọn
+
+Admin chạy `/setstocknotify channel:#kenh-thong-bao` một lần để lưu kênh thông báo
+riêng cho server vào SQLite. Bot cần View Channel, Send Messages và Embed Links.
+Khi `/addstock` thêm được account mới, phản hồi riêng hiện hai nút **Có, gửi thông báo**
+và **Không**. Chỉ admin vừa nhập kho được chọn và phải còn quyền admin khi bấm nút.
+Chọn Có sẽ gửi sản phẩm và số lượng thực tế vừa thêm, không gửi file, mật khẩu hay cookie,
+không ping mọi người. Thông báo nhắc khách dùng `/stock` để xem tồn thực tế vì đơn
+đặt trước có thể đã được ưu tiên giao. Chọn Không hoặc hết 3 phút sẽ không gửi.
+File toàn dòng trùng không hiện câu hỏi. Kho vẫn nhập bình thường nếu chưa cấu hình
+kênh hoặc gửi thông báo thất bại; bot báo riêng để admin cấu hình/thử lại, không nhập
+lại file. Tắt/khởi động lại bot sẽ đóng câu hỏi đang chờ, không tự đăng lại.
+Cập nhật tính năng này bằng cách thay `main.py`, giữ nguyên dữ liệu và khởi động lại.

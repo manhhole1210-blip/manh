@@ -129,7 +129,7 @@ class BotSQLiteTests(unittest.TestCase):
             await self.bot.addstock.callback(interaction, 'default', file)
             self.assertEqual(self.bot.load_stock(), ['account1:pass1', 'account2:pass2', 'account3:pass3', 'account4:pass4'])
             embed = interaction.followup.send.call_args.kwargs['embed']
-            self.assertEqual([field.value for field in embed.fields], ['2', '2', '4'])
+            self.assertEqual([field.value for field in embed.fields[:3]], ['2', '2', '4'])
             self.assertTrue(interaction.followup.send.call_args.kwargs['ephemeral'])
             self.bot.update_stock_message.assert_awaited_once()
             logs = str(self.bot.load_activity_logs())

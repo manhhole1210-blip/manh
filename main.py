@@ -6887,6 +6887,100 @@ async def cancelcustomerpreorder(interaction: discord.Interaction, preorder_id: 
     await cancelpreorder.callback(interaction, preorder_id)
 
 
+def stock_notify_config_path():
+    return os.path.join(DATA_DIR, 'stock_notify_channels.json')
+
+
+@tree.command(name='setstocknotify', description='Admin: choose the channel for optional stock upload announcements')
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin_check()
+async def setstocknotify(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not can_manage(interaction):
+        await interaction.response.send_message('❌ Chỉ admin / Admin only.', ephemeral=True)
+        return
+    if channel.guild.id != interaction.guild.id:
+        await interaction.response.send_message('❌ Chọn kênh trong server này / Choose a channel in this server.', ephemeral=True)
+        return
+    permissions = channel.permissions_for(interaction.guild.me)
+    if not (permissions.view_channel and permissions.send_messages and permissions.embed_links):
+        await interaction.response.send_message('❌ Bot cần quyền View Channel, Send Messages và Embed Links trong kênh.', ephemeral=True)
+        return
+    async with SHOP_TRANSACTION_LOCK:
+        with data_transaction():
+            channels = load_json(stock_notify_config_path(), {})
+            channels[str(interaction.guild.id)] = channel.id
+            save_json(stock_notify_config_path(), channels)
+            log_activity(interaction.user.id, interaction.user.name, 'stock_notify_channel_set', {'channel_id': channel.id}, 'command')
+    await interaction.response.send_message(f'✅ Kênh thông báo nhập kho: {channel.mention}. /addstock sẽ hỏi Có/Không trước khi gửi.', ephemeral=True)
+
+
+class StockNotifyView(View):
+    def __init__(self, user_id, guild_id, product_id, product_name, quantity, lang):
+        super().__init__(timeout=180)
+        self.user_id, self.guild_id = user_id, guild_id
+        self.product_id, self.product_name, self.quantity = product_id, product_name, quantity
+        self.lang, self.completed = lang, False
+        self.lock = asyncio.Lock()
+        self.children[0].label = pick(lang, 'Có, gửi thông báo', 'Yes, announce')
+        self.children[1].label = pick(lang, 'Không', 'No')
+
+    async def authorized(self, interaction):
+        if (not can_manage(interaction) or interaction.user.id != self.user_id
+                or interaction.guild.id != self.guild_id):
+            await interaction.response.send_message('❌ Chỉ admin vừa nhập kho được chọn / Only the uploading admin may choose.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Yes, announce', style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: Button):
+        if not await self.authorized(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with self.lock:
+            if self.completed:
+                await interaction.followup.send('ℹ️ Đã xử lý lựa chọn / Already handled.', ephemeral=True)
+                return
+            channel_id = load_json(stock_notify_config_path(), {}).get(str(self.guild_id))
+            if not channel_id:
+                await interaction.followup.send('❌ Chưa chọn kênh. Dùng /setstocknotify rồi bấm Có lại. Kho đã nhập thành công; không nhập lại file.', ephemeral=True)
+                return
+            try:
+                channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+                if getattr(getattr(channel, 'guild', None), 'id', None) != self.guild_id:
+                    await interaction.followup.send('❌ Kênh thông báo không thuộc server này. Dùng /setstocknotify để chọn lại.', ephemeral=True)
+                    return
+                # Only public catalog data and counts; no uploaded credentials or file.
+                embed = make_embed(pick(self.lang, '📦 Lemon Service • Vừa nhập hàng', '📦 Lemon Service • Stock Added'),
+                    f"**{discord.utils.escape_markdown(self.product_name)[:500]}**", UI_GREEN)
+                embed.add_field(name=pick(self.lang, 'Số lượng vừa nhập', 'Quantity added'), value=f'{self.quantity:,}', inline=False)
+                embed.add_field(name=pick(self.lang, 'Mua hàng', 'Shop'), value=pick(self.lang,
+                    'Dùng /stock để kiểm tra hàng còn lại và /buy để mua. Đơn đặt trước được ưu tiên phân hàng.',
+                    'Use /stock for remaining stock and /buy to purchase. Preorders receive priority allocation.'), inline=False)
+                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            except (discord.HTTPException, OSError, ValueError):
+                logging.warning('[STOCK] Announcement failed; stock upload remains committed')
+                await interaction.followup.send('❌ Không gửi được thông báo. Kiểm tra kênh và quyền bot rồi thử lại. Kho đã nhập thành công; không nhập lại file.', ephemeral=True)
+                return
+            self.completed = True
+            self.stop()
+            await interaction.edit_original_response(content=f'✅ Đã gửi thông báo nhập kho vào <#{channel_id}>.', view=None)
+
+    @discord.ui.button(label='No', style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: Button):
+        if not await self.authorized(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with self.lock:
+            if self.completed:
+                await interaction.followup.send('ℹ️ Đã xử lý lựa chọn / Already handled.', ephemeral=True)
+                return
+            self.completed = True
+            self.stop()
+            await interaction.edit_original_response(content=pick(self.lang,
+                '✅ Đã nhập kho, không gửi thông báo.', '✅ Stock uploaded without an announcement.'), view=None)
+
+
 @tree.command(name="addstock", description="Admin: select a product and upload a TXT file to add stock")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -6980,7 +7074,14 @@ async def addstock(interaction: discord.Interaction, product: str, file: discord
         (pick(lang, "Tổng tồn kho", "Total stock"), total)
     ):
         embed.add_field(name=name, value=f"{value:,}", inline=True)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    if added:
+        prompt = pick(lang, 'Bạn có muốn gửi thông báo nhập kho vào kênh đã chỉ định không? Chọn Có hoặc Không. Hết 3 phút sẽ không gửi.',
+                      'Announce this stock upload in the configured channel? Choose Yes or No. No announcement after 3 minutes.')
+        embed.add_field(name=pick(lang, '📣 Thông báo nhập kho', '📣 Stock announcement'), value=prompt, inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True,
+            view=StockNotifyView(interaction.user.id, interaction.guild.id, target['id'], target['name'], len(added), lang))
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
     if added:
         await process_preorders()
         try:

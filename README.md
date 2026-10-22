@@ -191,3 +191,5 @@ cú pháp các script PowerShell trên Windows. Kết quả từng lần chạy 
 Mã nạp ngân hàng: mỗi khách được cấp mã cố định 8 ký tự, ví dụ `LCK7M9X2`, khi tạo yêu cầu nạp. Mã lưu trong SQLite, không đổi theo username hoặc khi khởi động lại. QR tự điền mã; mã LC + User ID cũ vẫn được hỗ trợ. Giao dịch dùng username cũ vẫn cần đối soát. Khi nâng cấp, thay cả `main.py` và `sqlite_store.py`, giữ nguyên `data/bot.db`.
 
 Đặt trước trả đủ tiền: nút **Đặt trước** hoặc `/preorder`; `/mypreorders` xem đơn, khách không thể tự hủy sau khi xác nhận. Chỉ admin dùng `/cancelpreorder` hủy đơn chưa phân hàng và hoàn đủ vào số dư khách. Tự phân hàng FIFO khi nhập kho, không trừ tiền lần nữa. Admin: `/preorders`, `/cancelcustomerpreorder`. Nâng cấp cả `main.py` và `sqlite_store.py`, giữ nguyên dữ liệu. Chi tiết trong WINDOWS_VPS.md.
+
+Thông báo nhập kho: admin đặt kênh bằng `/setstocknotify channel`; `/addstock` sẽ hỏi **Có/Không** sau khi thêm account mới. Chỉ gửi tên sản phẩm và số lượng, không gửi nội dung account.
